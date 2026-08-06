@@ -561,6 +561,16 @@ async def test_load_json_rejects_malformed_payloads(user: User,
     assert r.id in c._objects                                     # registry untouched
 
 
+async def test_load_json_drops_objects_with_an_unhashable_type(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """JSON can carry a list or dict where a type name is expected — dropped, never a TypeError."""
+    await user.open('/')
+    c = canvas_page()
+    c.load_json(json.dumps({'objects': [{'type': ['Rect']}, {'type': {'a': 1}},
+                                        {'type': None}, {'type': 'Rect'}]}))
+    assert [o['type'] for o in c._objects.values()] == ['Rect']
+
+
 async def test_load_json_clears_selection(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
     await user.open('/')
     c = canvas_page()

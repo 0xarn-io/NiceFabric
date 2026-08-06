@@ -414,9 +414,14 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
             raise ValueError(f'more than {_MAX_OBJECTS} objects')
         fresh: dict[str, dict] = {}
         for obj in objects:
-            if not isinstance(obj, dict) or obj.get('type') not in _SUPPORTED_TYPES:
+            if not isinstance(obj, dict):
                 continue
-            if obj.get('type') == 'Image':
+            type_ = obj.get('type')
+            # the isinstance guard is load-bearing: an unhashable value (JSON gives lists and
+            # dicts) would make the ``in`` test raise TypeError instead of dropping the object
+            if not isinstance(type_, str) or type_ not in _SUPPORTED_TYPES:
+                continue
+            if type_ == 'Image':
                 src = obj.get('src')
                 if not isinstance(src, str) or not src.startswith(('https://', 'http://', 'data:image/')):
                     continue
