@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import re
 import uuid
 import warnings
@@ -9,11 +11,40 @@ from typing import Any
 
 from nicegui.awaitable_response import AwaitableResponse, NullResponse
 from nicegui.element import Element
-from nicegui.events import GenericEventArguments
+from nicegui.events import GenericEventArguments, Handler
 
 logger = logging.getLogger(__name__)
 
 _METHOD_NAME = re.compile(r'^[A-Za-z_$][\w$.]*$')
+
+_GEOMETRY_KEYS = frozenset({'left', 'top', 'scaleX', 'scaleY', 'angle',
+                             'skewX', 'skewY', 'flipX', 'flipY', 'width', 'height'})
+_TEXT_TYPES = frozenset({'Textbox', 'IText', 'FabricText', 'Text'})
+_PATH_KEYS = frozenset({'type', 'id', 'path', 'left', 'top', 'width', 'height',
+                         'scaleX', 'scaleY', 'angle', 'fill', 'stroke', 'strokeWidth',
+                         'strokeLineCap', 'strokeLineJoin', 'strokeMiterLimit', 'strokeDashArray'})
+_MAX_TEXT_LEN = 20_000
+_MAX_PATH_BYTES = 256_000
+
+
+def _clean_geometry(props: Any) -> dict:
+    """Filter untrusted ``props`` down to well-typed geometry keys only.
+
+    Never trust a browser-originated payload: this is the single choke point every
+    ``object-modified`` event must pass through before touching the canonical registry.
+    """
+    if not isinstance(props, dict):
+        return {}
+    clean: dict[str, Any] = {}
+    for key, value in props.items():
+        if key not in _GEOMETRY_KEYS:
+            continue
+        if key in ('flipX', 'flipY'):
+            if isinstance(value, bool):
+                clean[key] = value
+        elif isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            clean[key] = value
+    return clean
 
 
 class FabricObject:
@@ -50,7 +81,15 @@ class FabricObject:
 class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nicefabric.min.mjs']):
 
     def __init__(self, width: int = 800, height: int = 600, *,
-                 background: str = '#ffffff', selection: bool = True) -> None:
+                 background: str = '#ffffff', selection: bool = True,
+                 keyboard_delete: bool = False,
+                 on_selection: Handler[GenericEventArguments] | None = None,
+                 on_modified: Handler[GenericEventArguments] | None = None,
+                 on_added: Handler[GenericEventArguments] | None = None,
+                 on_error: Handler[GenericEventArguments] | None = None,
+                 on_mouse_down: Handler[GenericEventArguments] | None = None,
+                 on_mouse_up: Handler[GenericEventArguments] | None = None,
+                 on_text_changed: Handler[GenericEventArguments] | None = None) -> None:
         super().__init__()
         self._props['width'] = width
         self._props['height'] = height
@@ -58,10 +97,23 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
         self._props['selection'] = selection
         self._objects: dict[str, dict] = {}
         self._canvas_state: dict[str, Any] = {}
+        self._selected: list[str] = []
         self.is_initialized = False
         self._init_event = asyncio.Event()
+        self._props['keyboardDelete'] = keyboard_delete  # camelCase like the other props — no Vue kebab normalization to reason about
         self.on('init', self._handle_init)
         self.on('object-error', self._handle_object_error)
+        self.on('object-modified', self._on_modified)
+        self.on('object-added', self._on_added)
+        self.on('text-changed', self._on_text_changed, throttle=0.2)
+        self.on('selection', self._on_selection)
+        self.on('request-delete', self._on_request_delete)
+        for event, handler in [('selection', on_selection), ('object-modified', on_modified),
+                                ('object-added', on_added), ('object-error', on_error),
+                                ('mouse-down', on_mouse_down), ('mouse-up', on_mouse_up),
+                                ('text-changed', on_text_changed)]:
+            if handler is not None:
+                self.on(event, handler)
 
     def _handle_init(self) -> None:
         self.is_initialized = True
@@ -82,6 +134,71 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
         object_id = payload.get('id', '<unknown>')
         message = payload.get('message', '<no message>')
         logger.warning('nicefabric: object %s failed to revive in the browser: %s', object_id, message)
+
+    def _on_modified(self, e: GenericEventArguments) -> None:
+        """Merge browser-reported geometry into one registry entry.
+
+        Never applied to an ``ActiveSelection`` member directly — the JS side skips those and
+        instead re-emits absolute coords on deselection (see ``fabric_canvas.js``).
+        """
+        id_ = e.args.get('id') if isinstance(e.args, dict) else None
+        entry = self._objects.get(id_) if isinstance(id_, str) else None
+        if entry is not None:
+            entry.update(_clean_geometry(e.args.get('props')))
+
+    def _on_added(self, e: GenericEventArguments) -> None:
+        """Register a freehand-drawn path. The only source of ``object-added`` — see JS side."""
+        if not isinstance(e.args, dict):
+            return
+        id_, obj = e.args.get('id'), e.args.get('obj')
+        if (not isinstance(id_, str) or id_ in self._objects or not isinstance(obj, dict)
+                or obj.get('type') != 'Path' or len(json.dumps(obj)) > _MAX_PATH_BYTES):
+            return
+        self._objects[id_] = {k: v for k, v in obj.items() if k in _PATH_KEYS} | {'id': id_}
+
+    def _on_text_changed(self, e: GenericEventArguments) -> None:
+        if not isinstance(e.args, dict):
+            return
+        id_, text = e.args.get('id'), e.args.get('text')
+        entry = self._objects.get(id_) if isinstance(id_, str) else None
+        if (entry is not None and entry.get('type') in _TEXT_TYPES
+                and isinstance(text, str) and len(text) <= _MAX_TEXT_LEN):
+            entry['text'] = text
+
+    def _on_selection(self, e: GenericEventArguments) -> None:
+        ids = e.args.get('ids') if isinstance(e.args, dict) else None
+        self._selected = [i for i in ids if isinstance(i, str) and i in self._objects] \
+            if isinstance(ids, list) else []
+
+    def _on_request_delete(self, e: GenericEventArguments) -> None:
+        """Keyboard-delete round-trips through Python so the registry never diverges.
+
+        Unlike ``remove_object`` (which raises ``KeyError`` for Python callers on an unknown
+        id), this handler must no-op silently: the browser can name a stale or forged id.
+        """
+        ids = e.args.get('ids') if isinstance(e.args, dict) else []
+        for id_ in ids if isinstance(ids, list) else []:
+            if isinstance(id_, str) and id_ in self._objects:
+                self.remove_object(id_)
+
+    def get_selected(self) -> list[FabricObject]:
+        return [FabricObject(self, i) for i in self._selected if i in self._objects]
+
+    def remove_selected(self) -> None:
+        """Delete every currently-selected object.
+
+        Iterates ids (not the live ``get_selected()`` handles) so removing one entry from
+        ``self._objects`` doesn't affect the list being walked; ``remove_object`` is skipped
+        for any id that already vanished from the registry (e.g. removed elsewhere first).
+        """
+        for id_ in list(self._selected):
+            if id_ in self._objects:
+                self.remove_object(id_)
+        self._selected = []
+
+    def discard_selection(self) -> None:
+        self._selected = []
+        self.run_method('discard_selection')
 
     async def initialized(self) -> None:
         """Wait until the browser-side canvas exists (never resolves in user-fixture tests)."""

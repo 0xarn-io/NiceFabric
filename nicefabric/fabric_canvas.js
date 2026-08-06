@@ -4,7 +4,7 @@ fabric.FabricObject.customProperties = ["id"];
 
 export default {
   template: "<div></div>",
-  props: { width: Number, height: Number, background: String, selection: Boolean },
+  props: { width: Number, height: Number, background: String, selection: Boolean, keyboardDelete: Boolean },
   mounted() {
     // a <canvas> root would be re-parented by Fabric into .canvas-container,
     // breaking NiceGUI .classes()/.style() — so the root is a <div>
@@ -25,6 +25,54 @@ export default {
       this.$emit("init");
       clearInterval(this._initInterval);
     }, 100);
+
+    // --- sync-back: browser-side changes flow back into Python's canonical registry.
+    // Every payload here is a bandwidth courtesy only — the server re-validates everything.
+    const GEOMETRY_KEYS = ["left", "top", "scaleX", "scaleY", "angle",
+                           "skewX", "skewY", "flipX", "flipY", "width", "height"];
+    const geometryOf = (o) => Object.fromEntries(GEOMETRY_KEYS.map((k) => [k, o[k]]));
+    const c = this.canvas;
+
+    c.on("object:modified", (e) => {
+      const t = e.target;
+      if (!t || t instanceof fabric.ActiveSelection) return;  // multi-select: synced on deselect below
+      if (t.id) this.$emit("object-modified", { id: t.id, props: geometryOf(t) });
+    });
+    const syncDeselected = (e) => {
+      const gone = e.deselected ?? [];
+      setTimeout(() => {  // next tick: fabric has restored absolute coords
+        for (const o of gone) {
+          if (o.id && !o.group) this.$emit("object-modified", { id: o.id, props: geometryOf(o) });
+        }
+      }, 0);
+    };
+    const emitSelection = (kind) =>
+      this.$emit("selection", { kind, ids: c.getActiveObjects().map((o) => o.id).filter(Boolean) });
+    c.on("selection:created", () => emitSelection("created"));
+    c.on("selection:updated", (e) => { syncDeselected(e); emitSelection("updated"); });
+    c.on("selection:cleared", (e) => { syncDeselected(e); emitSelection("cleared"); });
+
+    c.on("path:created", (e) => {
+      e.path.id = crypto.randomUUID().replaceAll("-", "");
+      this.$emit("object-added", { id: e.path.id, obj: e.path.toObject(["id"]) });
+    });
+    c.on("text:changed", (e) => {
+      if (e.target?.id) this.$emit("text-changed", { id: e.target.id, text: e.target.text });
+    });
+    for (const ev of ["mouse:down", "mouse:up"]) {
+      c.on(ev, (e) => {
+        const p = c.getScenePoint(e.e);
+        this.$emit(ev.replace(":", "-"), { x: p.x, y: p.y, id: e.target?.id ?? null });
+      });
+    }
+    if (this.keyboardDelete) {
+      c.upperCanvasEl.tabIndex = 0;
+      c.upperCanvasEl.addEventListener("keydown", (e) => {
+        if (e.key === "Delete" || e.key === "Backspace") {
+          this.$emit("request-delete", { ids: c.getActiveObjects().map((o) => o.id).filter(Boolean) });
+        }
+      });
+    }
   },
   beforeUnmount() {
     clearInterval(this._initInterval);
@@ -107,6 +155,12 @@ export default {
       return this._enqueue(() => {
         const o = this.find(id);
         if (o) this.canvas.sendObjectToBack(o);
+        this.canvas.requestRenderAll();
+      });
+    },
+    discard_selection() {
+      return this._enqueue(() => {
+        this.canvas.discardActiveObject();
         this.canvas.requestRenderAll();
       });
     },

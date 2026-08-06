@@ -1,11 +1,18 @@
+import json
 from typing import Callable
 
 import pytest
 from nicegui import ui
 from nicegui.awaitable_response import NullResponse
+from nicegui.events import GenericEventArguments
 from nicegui.testing import User
 
 from nicefabric import FabricCanvas
+from nicefabric.fabric_canvas import _MAX_PATH_BYTES
+
+
+def _ev(canvas: FabricCanvas, args: dict) -> GenericEventArguments:
+    return GenericEventArguments(sender=canvas, client=canvas.client, args=args)
 
 
 @pytest.fixture
@@ -230,6 +237,219 @@ async def test_run_methods_accept_legitimate_names(user: User, canvas_page: Call
     assert isinstance(c.run_canvas_method('setZoom', 2), NullResponse)
     assert isinstance(c.run_object_method(r, 'get', 'left'), NullResponse)
     assert isinstance(c.run_canvas_method(':setZoom', '1 + 1'), NullResponse)  # the JS-eval form
+
+
+async def test_modified_merges_geometry_only(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    r = c.add_rect(left=0, top=0)
+    c._on_modified(_ev(c, {'id': r.id, 'props': {
+        'left': 50.5, 'angle': 90, 'type': 'Image', 'src': 'https://evil', 'fill': 'green'}}))
+    entry = c._objects[r.id]
+    assert entry['left'] == 50.5 and entry['angle'] == 90
+    assert entry['type'] == 'Rect' and 'src' not in entry and entry.get('fill') != 'green'
+
+
+async def test_modified_rejects_nan_and_unknown_id(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    r = c.add_rect(left=0)
+    c._on_modified(_ev(c, {'id': r.id, 'props': {'left': float('nan')}}))
+    assert c._objects[r.id]['left'] == 0
+    c._on_modified(_ev(c, {'id': 'nope', 'props': {'left': 1}}))   # silently ignored
+
+
+async def test_modified_rejects_bool_and_non_finite(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """bool is a subclass of int in Python — must not sneak into numeric geometry keys."""
+    await user.open('/')
+    c = canvas_page()
+    r = c.add_rect(left=0, flipX=False)
+    c._on_modified(_ev(c, {'id': r.id, 'props': {
+        'left': True, 'top': float('inf'), 'flipX': 'yes'}}))
+    assert c._objects[r.id]['left'] == 0
+    assert 'top' not in c._objects[r.id]
+    assert c._objects[r.id]['flipX'] is False
+
+
+async def test_path_added_validated(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    c._on_added(_ev(c, {'id': 'p1', 'obj': {'type': 'Path', 'path': [['M', 0, 0]], 'stroke': '#000'}}))
+    assert 'p1' in c._objects
+    c._on_added(_ev(c, {'id': 'p1', 'obj': {'type': 'Path', 'path': []}}))        # duplicate id → ignored
+    c._on_added(_ev(c, {'id': 'p2', 'obj': {'type': 'Image', 'src': 'x'}}))        # wrong type → ignored
+    assert 'p2' not in c._objects and c._objects['p1']['stroke'] == '#000'
+
+
+async def test_path_added_rejects_oversized_payload(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    obj = {'type': 'Path', 'path': [['L', 0, 0]]}
+    while len(json.dumps(obj)) <= _MAX_PATH_BYTES:                # grow past the cap, precisely
+        obj['path'].append(['L', 1, 1])
+    c._on_added(_ev(c, {'id': 'big', 'obj': obj}))
+    assert 'big' not in c._objects
+
+
+async def test_text_changed_capped_and_typed(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    t = c.add_text('hi')
+    r = c.add_rect()
+    c._on_text_changed(_ev(c, {'id': t.id, 'text': 'new'}))
+    assert c._objects[t.id]['text'] == 'new'
+    c._on_text_changed(_ev(c, {'id': r.id, 'text': 'nope'}))       # not a text type → ignored
+    c._on_text_changed(_ev(c, {'id': t.id, 'text': 'x' * 30_000})) # over cap → ignored
+    assert c._objects[t.id]['text'] == 'new'
+
+
+async def test_selection_tracked_and_remove_selected(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    a, b = c.add_rect(), c.add_rect()
+    c._on_selection(_ev(c, {'kind': 'created', 'ids': [a.id, 'bogus', b.id]}))
+    assert [o.id for o in c.get_selected()] == [a.id, b.id]
+    c.remove_selected()
+    assert not c._objects and not c.get_selected()
+
+
+async def test_request_delete_removes_known_ids_and_ignores_unknown(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """The critical fix over the stale brief: remove_object raises KeyError on unknown ids for
+    Python callers, but a browser-originated request-delete must no-op silently on a stale/hostile id."""
+    await user.open('/')
+    c = canvas_page()
+    a, b = c.add_rect(), c.add_rect()
+    c._on_request_delete(_ev(c, {'ids': [a.id, 'unknown-id', 12345]}))  # must not raise
+    assert a.id not in c._objects
+    assert b.id in c._objects
+
+
+async def test_discard_selection_clears_local_state(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    a = c.add_rect()
+    c._on_selection(_ev(c, {'kind': 'created', 'ids': [a.id]}))
+    assert c.get_selected()
+    c.discard_selection()
+    assert not c.get_selected()
+
+
+async def test_ctor_kwargs_wire_user_handlers(user: User) -> None:
+    """Every on_* ctor kwarg registers as a real event listener alongside the internal handler."""
+    from nicegui.helpers import event_type_to_camel_case
+
+    handlers = {
+        'selection': lambda e: None,
+        'object-modified': lambda e: None,
+        'object-added': lambda e: None,
+        'object-error': lambda e: None,
+        'mouse-down': lambda e: None,
+        'mouse-up': lambda e: None,
+        'text-changed': lambda e: None,
+    }
+
+    @ui.page('/')
+    def page() -> None:
+        FabricCanvas(
+            on_selection=handlers['selection'],
+            on_modified=handlers['object-modified'],
+            on_added=handlers['object-added'],
+            on_error=handlers['object-error'],
+            on_mouse_down=handlers['mouse-down'],
+            on_mouse_up=handlers['mouse-up'],
+            on_text_changed=handlers['text-changed'],
+        )
+
+    await user.open('/')
+    c = user.find(FabricCanvas).elements.pop()
+    registered = {(listener.type, listener.handler) for listener in c._event_listeners.values()}
+    for event, handler in handlers.items():
+        assert (event_type_to_camel_case(event), handler) in registered
+
+
+async def test_keyboard_delete_prop_defaults_false_and_is_settable(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    default_canvas = canvas_page()
+    assert default_canvas._props['keyboardDelete'] is False
+
+
+async def test_keyboard_delete_prop_true_when_requested(user: User) -> None:
+    @ui.page('/')
+    def page() -> None:
+        FabricCanvas(keyboard_delete=True)
+
+    await user.open('/')
+    (enabled_canvas,) = user.find(FabricCanvas).elements
+    assert enabled_canvas._props['keyboardDelete'] is True
+
+
+# --- hostile-input coverage: every handler must no-op, never raise, on malformed payloads ---
+
+async def test_on_modified_hostile_payloads(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    r = c.add_rect(left=0)
+    c._on_modified(_ev(c, 'not-a-dict'))                          # args not a dict
+    c._on_modified(_ev(c, {'props': {'left': 5}}))                 # missing id
+    c._on_modified(_ev(c, {'id': 123, 'props': {'left': 5}}))      # id wrong type
+    c._on_modified(_ev(c, {'id': r.id, 'props': 'not-a-dict'}))    # props not a dict
+    c._on_modified(_ev(c, {'id': r.id, 'props': None}))            # props missing/None
+    assert c._objects[r.id]['left'] == 0
+
+
+async def test_on_added_hostile_payloads(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    c._on_added(_ev(c, 'not-a-dict'))                              # args not a dict
+    c._on_added(_ev(c, {'obj': {'type': 'Path', 'path': []}}))     # missing id
+    c._on_added(_ev(c, {'id': 42, 'obj': {'type': 'Path', 'path': []}}))  # id wrong type
+    c._on_added(_ev(c, {'id': 'x1', 'obj': 'not-a-dict'}))         # obj not a dict
+    c._on_added(_ev(c, {'id': 'x2'}))                              # missing obj
+    assert c._objects == {}
+
+
+async def test_on_text_changed_hostile_payloads(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    t = c.add_text('hi')
+    c._on_text_changed(_ev(c, 'not-a-dict'))                       # args not a dict
+    c._on_text_changed(_ev(c, {'text': 'nope'}))                   # missing id
+    c._on_text_changed(_ev(c, {'id': 123, 'text': 'nope'}))        # id wrong type
+    c._on_text_changed(_ev(c, {'id': t.id, 'text': 123}))          # text wrong type
+    c._on_text_changed(_ev(c, {'id': t.id}))                       # missing text
+    assert c._objects[t.id]['text'] == 'hi'
+
+
+async def test_on_selection_hostile_payloads(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    a = c.add_rect()
+    c._on_selection(_ev(c, {'kind': 'created', 'ids': [a.id]}))
+    assert c._selected == [a.id]
+    c._on_selection(_ev(c, 'not-a-dict'))                          # args not a dict → cleared
+    assert c._selected == []
+    c._on_selection(_ev(c, {'kind': 'created', 'ids': [a.id]}))
+    c._on_selection(_ev(c, {'kind': 'created', 'ids': 'not-a-list'}))  # ids not a list → cleared
+    assert c._selected == []
+    c._on_selection(_ev(c, {'kind': 'created'}))                   # missing ids → cleared
+    assert c._selected == []
+    c._on_selection(_ev(c, {'kind': 'created', 'ids': [a.id, 123, None]}))  # non-str entries dropped
+    assert c._selected == [a.id]
+
+
+async def test_on_request_delete_hostile_payloads(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    a = c.add_rect()
+    c._on_request_delete(_ev(c, 'not-a-dict'))                     # args not a dict
+    c._on_request_delete(_ev(c, {}))                                # missing ids
+    c._on_request_delete(_ev(c, {'ids': 'not-a-list'}))            # ids not a list
+    c._on_request_delete(_ev(c, {'ids': [123, None, {}]}))         # wrong-typed entries
+    assert a.id in c._objects                                       # nothing above touched the registry
+    c._on_request_delete(_ev(c, {'ids': [a.id]}))
+    assert a.id not in c._objects
 
 
 async def test_handle_init_replays_canvas_state(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
