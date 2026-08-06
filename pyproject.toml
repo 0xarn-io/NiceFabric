@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nicefabric"
+version = "0.1.0"
+description = "Fabric.js canvas element for NiceGUI"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = ["nicegui>=3.6,<4"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "playwright", "build"]
+
+[tool.hatch.build]
+artifacts = ["nicefabric/lib/*.mjs"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["nicefabric"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+main_file = ""
+markers = [
+    "e2e: browser end-to-end test (tests/e2e_playwright.py; needs chromium, not collected by `pytest tests/`)",
+]
