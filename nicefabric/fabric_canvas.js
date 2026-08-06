@@ -52,5 +52,59 @@ export default {
       if (this.find(obj.id)) return;  // idempotent — replay-safe
       await this.enliven_and_add([obj]);
     },
+    update_object(id, props) {
+      const o = this.find(id);
+      if (!o) return;
+      o.set(props);
+      o.setCoords();
+      this.canvas.requestRenderAll();
+    },
+    remove_object(id) {
+      const o = this.find(id);
+      if (o) this.canvas.remove(o);
+      this.canvas.requestRenderAll();
+    },
+    clear() {
+      this.canvas.remove(...this.canvas.getObjects());
+      this.canvas.requestRenderAll();
+    },
+    set_background(color) {
+      this.canvas.backgroundColor = color;
+      this.canvas.requestRenderAll();
+    },
+    set_zoom(z) { this.canvas.setZoom(z); },
+    absolute_pan(x, y) { this.canvas.absolutePan(new fabric.Point(x, y)); },
+    resize(w, h) { this.canvas.setDimensions({ width: w, height: h }); },
+    bring_to_front(id) {
+      const o = this.find(id);
+      if (o) this.canvas.bringObjectToFront(o);
+      this.canvas.requestRenderAll();
+    },
+    send_to_back(id) {
+      const o = this.find(id);
+      if (o) this.canvas.sendObjectToBack(o);
+      this.canvas.requestRenderAll();
+    },
+    set_draw_mode(on, opts) {
+      this.canvas.isDrawingMode = on;
+      if (on) {
+        const b = new fabric.PencilBrush(this.canvas);
+        b.color = opts.color;
+        b.width = opts.width;
+        this.canvas.freeDrawingBrush = b;
+      }
+    },
+    run_canvas_method(name, ...args) { return this._run(this.canvas, name, args); },
+    run_object_method(id, name, ...args) {
+      const o = this.find(id);
+      if (o) return this._run(o, name, args);
+    },
+    _run(target, name, args) {
+      if (name.startsWith(":")) {
+        name = name.slice(1);
+        args = args.map((a) => new Function(`return (${a})`)());
+      }
+      return runMethod(target, name, args);
+    },
   },
 };
