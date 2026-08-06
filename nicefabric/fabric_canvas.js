@@ -16,6 +16,10 @@ export default {
       backgroundColor: this.background,
       selection: this.selection,
     });
+    // ops are enqueued on this chain so they apply in the order Python issued them:
+    // add_object/sync_objects are async (enlivening an image is a network load) and NiceGUI
+    // does not await a method before dispatching the next one
+    this._queue = Promise.resolve();
     this._initInterval = setInterval(() => {
       if (window.socket.id === undefined) return;  // Leaflet handshake pattern
       this.$emit("init");
@@ -29,6 +33,11 @@ export default {
   methods: {
     find(id) {
       return this.canvas.getObjects().find((o) => o.id === id);
+    },
+    _enqueue(op) {
+      const result = this._queue.then(op);
+      this._queue = result.catch(() => {});  // a failing op must not poison the ops behind it
+      return result;  // callers (and Python awaits) still see the real value or rejection
     },
     async enliven_and_add(objs) {
       const results = await Promise.allSettled(
@@ -44,60 +53,82 @@ export default {
       });
       this.canvas.requestRenderAll();
     },
-    async sync_objects(objs) {
-      this.canvas.remove(...this.canvas.getObjects());
-      await this.enliven_and_add(objs);
+    sync_objects(objs) {
+      return this._enqueue(async () => {
+        this.canvas.remove(...this.canvas.getObjects());
+        await this.enliven_and_add(objs);
+      });
     },
-    async add_object(obj) {
-      if (this.find(obj.id)) return;  // idempotent — replay-safe
-      await this.enliven_and_add([obj]);
+    add_object(obj) {
+      return this._enqueue(async () => {
+        if (this.find(obj.id)) return;  // idempotent — replay-safe
+        await this.enliven_and_add([obj]);
+      });
     },
     update_object(id, props) {
-      const o = this.find(id);
-      if (!o) return;
-      o.set(props);
-      o.setCoords();
-      this.canvas.requestRenderAll();
+      return this._enqueue(() => {
+        const o = this.find(id);
+        if (!o) return;
+        o.set(props);
+        o.setCoords();
+        this.canvas.requestRenderAll();
+      });
     },
     remove_object(id) {
-      const o = this.find(id);
-      if (o) this.canvas.remove(o);
-      this.canvas.requestRenderAll();
+      return this._enqueue(() => {
+        const o = this.find(id);
+        if (o) this.canvas.remove(o);
+        this.canvas.requestRenderAll();
+      });
     },
     clear() {
-      this.canvas.remove(...this.canvas.getObjects());
-      this.canvas.requestRenderAll();
+      return this._enqueue(() => {
+        this.canvas.remove(...this.canvas.getObjects());
+        this.canvas.requestRenderAll();
+      });
     },
     set_background(color) {
-      this.canvas.backgroundColor = color;
-      this.canvas.requestRenderAll();
+      return this._enqueue(() => {
+        this.canvas.backgroundColor = color;
+        this.canvas.requestRenderAll();
+      });
     },
-    set_zoom(z) { this.canvas.setZoom(z); },
-    absolute_pan(x, y) { this.canvas.absolutePan(new fabric.Point(x, y)); },
-    resize(w, h) { this.canvas.setDimensions({ width: w, height: h }); },
+    set_zoom(z) { return this._enqueue(() => this.canvas.setZoom(z)); },
+    absolute_pan(x, y) { return this._enqueue(() => this.canvas.absolutePan(new fabric.Point(x, y))); },
+    resize(w, h) { return this._enqueue(() => this.canvas.setDimensions({ width: w, height: h })); },
     bring_to_front(id) {
-      const o = this.find(id);
-      if (o) this.canvas.bringObjectToFront(o);
-      this.canvas.requestRenderAll();
+      return this._enqueue(() => {
+        const o = this.find(id);
+        if (o) this.canvas.bringObjectToFront(o);
+        this.canvas.requestRenderAll();
+      });
     },
     send_to_back(id) {
-      const o = this.find(id);
-      if (o) this.canvas.sendObjectToBack(o);
-      this.canvas.requestRenderAll();
+      return this._enqueue(() => {
+        const o = this.find(id);
+        if (o) this.canvas.sendObjectToBack(o);
+        this.canvas.requestRenderAll();
+      });
     },
     set_draw_mode(on, opts) {
-      this.canvas.isDrawingMode = on;
-      if (on) {
-        const b = new fabric.PencilBrush(this.canvas);
-        b.color = opts.color;
-        b.width = opts.width;
-        this.canvas.freeDrawingBrush = b;
-      }
+      return this._enqueue(() => {
+        this.canvas.isDrawingMode = on;
+        if (on) {
+          const b = new fabric.PencilBrush(this.canvas);
+          b.color = opts.color;
+          b.width = opts.width;
+          this.canvas.freeDrawingBrush = b;
+        }
+      });
     },
-    run_canvas_method(name, ...args) { return this._run(this.canvas, name, args); },
+    run_canvas_method(name, ...args) {
+      return this._enqueue(() => this._run(this.canvas, name, args));
+    },
     run_object_method(id, name, ...args) {
-      const o = this.find(id);
-      if (o) return this._run(o, name, args);
+      return this._enqueue(() => {
+        const o = this.find(id);
+        if (o) return this._run(o, name, args);
+      });
     },
     _run(target, name, args) {
       if (name.startsWith(":")) {

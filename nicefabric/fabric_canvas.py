@@ -32,10 +32,10 @@ class FabricObject:
         return dict(self._canvas._objects[self.id])
 
     def update(self, **props: Any) -> None:
-        self._canvas.update(self.id, **props)
+        self._canvas.update_object(self.id, **props)
 
     def delete(self) -> None:
-        self._canvas.remove(self.id)
+        self._canvas.remove_object(self.id)
 
     def bring_to_front(self) -> None:
         self._canvas.bring_to_front(self.id)
@@ -94,45 +94,62 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
         return super().run_method(name, *args, timeout=timeout)
 
     @staticmethod
-    def _warn_snake_case(props: dict) -> None:
+    def _warn_snake_case(props: dict, stacklevel: int) -> None:
+        """Warn about snake_case prop names.
+
+        :param stacklevel: passed to ``warnings.warn``, counted from *this* frame — so a caller
+            reached directly from user code passes 3, and one more frame down passes 4.
+        """
         for key in props:
             if '_' in key:
                 head, *rest = key.split('_')
                 suggestion = head + ''.join(part.title() for part in rest)
                 warnings.warn(f'prop {key!r} contains "_" — Fabric props are camelCase '
-                              f'(did you mean {suggestion!r}?)', UserWarning, stacklevel=3)
+                              f'(did you mean {suggestion!r}?)', UserWarning, stacklevel=stacklevel)
 
     @staticmethod
-    def _id_of(obj_or_id: 'FabricObject | str') -> str:
+    def _id_of(obj_or_id: FabricObject | str) -> str:
         return obj_or_id.id if isinstance(obj_or_id, FabricObject) else obj_or_id
 
-    def add_object(self, type_: str, **props: Any) -> FabricObject:
-        self._warn_snake_case(props)
+    def _known_id(self, obj_or_id: FabricObject | str) -> str:
+        """Resolve to an id that is currently in the registry, or raise ``KeyError``."""
+        id_ = self._id_of(obj_or_id)
+        if id_ not in self._objects:
+            raise KeyError(f'unknown object id {id_!r} — it was never added or has been removed')
+        return id_
+
+    def _add(self, type_: str, props: dict) -> FabricObject:
+        # every public entry point (`add_object` and the `add_*` helpers) sits exactly one frame
+        # above this one, so stacklevel 4 blames the user's own line for a snake_case prop
+        self._warn_snake_case(props, stacklevel=4)
         id_ = uuid.uuid4().hex
         self._objects[id_] = {'type': type_, 'id': id_, **props}
         self.run_method('add_object', self._objects[id_])
         return FabricObject(self, id_)
 
+    def add_object(self, type_: str, **props: Any) -> FabricObject:
+        return self._add(type_, props)
+
     def add_rect(self, **props: Any) -> FabricObject:
-        return self.add_object('Rect', **props)
+        return self._add('Rect', props)
 
     def add_circle(self, **props: Any) -> FabricObject:
-        return self.add_object('Circle', **props)
+        return self._add('Circle', props)
 
     def add_ellipse(self, **props: Any) -> FabricObject:
-        return self.add_object('Ellipse', **props)
+        return self._add('Ellipse', props)
 
     def add_line(self, x1: float, y1: float, x2: float, y2: float, **props: Any) -> FabricObject:
-        return self.add_object('Line', x1=x1, y1=y1, x2=x2, y2=y2, **props)
+        return self._add('Line', {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, **props})
 
     def add_polygon(self, points: list[dict], **props: Any) -> FabricObject:
-        return self.add_object('Polygon', points=points, **props)
+        return self._add('Polygon', {'points': points, **props})
 
     def add_polyline(self, points: list[dict], **props: Any) -> FabricObject:
-        return self.add_object('Polyline', points=points, **props)
+        return self._add('Polyline', {'points': points, **props})
 
     def add_path(self, path: str, **props: Any) -> FabricObject:
-        return self.add_object('Path', path=path, **props)
+        return self._add('Path', {'path': path, **props})
 
     def add_text(self, text: str, **props: Any) -> FabricObject:
         """Creates a Fabric *Textbox* (editable, word-wrapping).
@@ -140,32 +157,34 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
         For other text types use ``add_object('IText', text=...)`` etc.
         """
         props.setdefault('width', 200)
-        return self.add_object('Textbox', text=text, **props)
+        return self._add('Textbox', {'text': text, **props})
 
     def add_image(self, url: str, **props: Any) -> FabricObject:
         props.setdefault('crossOrigin', 'anonymous')  # keeps toDataURL un-tainted
-        return self.add_object('Image', src=url, **props)
+        return self._add('Image', {'src': url, **props})
 
-    def update(self, obj_or_id: FabricObject | str | None = None, **props: Any) -> None:
-        # `Element.update()` is called with no arguments by NiceGUI internals
-        # (e.g. `.on()`, `.classes()`, `.style()`, `.props()`) to re-render this
-        # element on the client. That base signature collides with the canvas-op
-        # `update(obj_or_id, **props)` this class needs, so a bare no-arg call
-        # falls back to the inherited behavior instead of erroring.
-        if obj_or_id is None and not props:
-            super().update()
-            return
-        self._warn_snake_case(props)
-        id_ = self._id_of(obj_or_id)
+    def update_object(self, obj_or_id: FabricObject | str, **props: Any) -> None:
+        """Set props on one canvas object.
+
+        :raises KeyError: if the object is not in the registry (e.g. a handle used after
+            ``remove_object``/``clear_objects``)
+        """
+        self._warn_snake_case(props, stacklevel=3)
+        id_ = self._known_id(obj_or_id)
         self._objects[id_].update(props)
         self.run_method('update_object', id_, props)
 
-    def remove(self, obj_or_id: FabricObject | str) -> None:
-        id_ = self._id_of(obj_or_id)
-        self._objects.pop(id_, None)
+    def remove_object(self, obj_or_id: FabricObject | str) -> None:
+        """Remove one canvas object.
+
+        :raises KeyError: if the object is not in the registry (e.g. an already-removed handle)
+        """
+        id_ = self._known_id(obj_or_id)
+        del self._objects[id_]
         self.run_method('remove_object', id_)
 
-    def clear(self) -> None:
+    def clear_objects(self) -> None:
+        """Remove all canvas objects (NiceGUI child elements are untouched — see ``clear``)."""
         self._objects.clear()
         self.run_method('clear')
 
@@ -188,14 +207,25 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
         self.run_method('resize', width, height)
 
     def bring_to_front(self, obj_or_id: FabricObject | str) -> None:
-        id_ = self._id_of(obj_or_id)
+        """Move one object to the top of the z-order.
+
+        :raises KeyError: if the object is not in the registry
+        """
+        id_ = self._known_id(obj_or_id)
         self._objects[id_] = self._objects.pop(id_)      # move to end = top
         self.run_method('bring_to_front', id_)
 
     def send_to_back(self, obj_or_id: FabricObject | str) -> None:
-        id_ = self._id_of(obj_or_id)
+        """Move one object to the bottom of the z-order.
+
+        :raises KeyError: if the object is not in the registry
+        """
+        id_ = self._known_id(obj_or_id)
         entry = self._objects.pop(id_)
-        self._objects = {id_: entry, **self._objects}
+        rest = list(self._objects.items())
+        self._objects.clear()                            # rebuild in place: same dict object
+        self._objects[id_] = entry                       # move to front = bottom
+        self._objects.update(rest)
         self.run_method('send_to_back', id_)
 
     def enable_drawing(self, color: str = '#000000', width: int = 2) -> None:
@@ -211,11 +241,34 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
         return 'drawing' in self._canvas_state
 
     def run_canvas_method(self, name: str, *args: Any, timeout: float = 1) -> AwaitableResponse:
+        """Call a method on the browser-side ``fabric.Canvas`` and optionally await its result.
+
+        :param name: name of the Fabric canvas method, e.g. ``'setZoom'``
+        :param args: arguments passed to the method (JSON-serialized)
+        :param timeout: maximum time to wait for a response when awaited (default: 1 second)
+
+        .. warning::
+            If ``name`` is prefixed with ``':'``, every *argument* is evaluated as JavaScript
+            source in the browser of every viewer of this page (``new Function``). Never pass
+            untrusted or user-supplied data to a ``':'``-prefixed call.
+        """
         self._check_method_name(name)
         return self.run_method('run_canvas_method', name, *args, timeout=timeout)
 
     def run_object_method(self, obj_or_id: FabricObject | str, name: str, *args: Any,
                            timeout: float = 1) -> AwaitableResponse:
+        """Call a method on one browser-side Fabric object and optionally await its result.
+
+        :param obj_or_id: the object handle or its id
+        :param name: name of the Fabric object method, e.g. ``'get'``
+        :param args: arguments passed to the method (JSON-serialized)
+        :param timeout: maximum time to wait for a response when awaited (default: 1 second)
+
+        .. warning::
+            If ``name`` is prefixed with ``':'``, every *argument* is evaluated as JavaScript
+            source in the browser of every viewer of this page (``new Function``). Never pass
+            untrusted or user-supplied data to a ``':'``-prefixed call.
+        """
         self._check_method_name(name)
         return self.run_method('run_object_method', self._id_of(obj_or_id), name, *args, timeout=timeout)
 
