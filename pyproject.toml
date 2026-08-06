@@ -23,3 +23,6 @@ packages = ["nicefabric"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 main_file = ""
+markers = [
+    "e2e: browser end-to-end test (tests/e2e_playwright.py; needs chromium, not collected by `pytest tests/`)",
+]
