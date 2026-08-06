@@ -708,8 +708,12 @@ def check_export_failure_path(probe: Probe) -> None:
     elapsed = time.monotonic() - started
     assert result.startswith('RuntimeError: browser-side export failed:'), result
     assert 'tainted' in result.lower(), result
-    assert elapsed < 10, (f'the failure took {elapsed:.1f}s — with to_data_url(timeout=30) that '
-                          f'means it waited for the timeout instead of failing fast')
+    # Scaled by E2E_TIMEOUT so a contended runner can widen it, but capped well below the
+    # to_data_url(timeout=30) this exists to distinguish "failed fast" from "ran out the clock".
+    fast_budget = min(15, E2E_TIMEOUT / 2)
+    assert elapsed < fast_budget, (
+        f'the failure took {elapsed:.1f}s (budget {fast_budget:.1f}s) — with '
+        f'to_data_url(timeout=30) that means it waited for the timeout instead of failing fast')
     probe.assert_clean_console()   # the export failed, but it failed cleanly
 
 

@@ -13,7 +13,8 @@ from starlette.requests import Request
 
 from nicefabric import FabricCanvas
 from nicefabric.fabric_canvas import (_EXPORT_PATH, _MAX_JSON_BYTES, _MAX_OBJECTS, _MAX_PATH_BYTES,
-                                       _pending_exports, _receive_export)
+                                       _SUPPORTED_TYPES, _TEXT_TYPES, _pending_exports,
+                                       _receive_export)
 
 
 def _ev(canvas: FabricCanvas, args: dict) -> GenericEventArguments:
@@ -626,6 +627,106 @@ async def test_load_json_defaults_cross_origin_for_images(
     assert b['crossOrigin'] == 'use-credentials'          # the payload's own value is not overwritten
 
 
+def test_every_text_type_is_also_loadable() -> None:
+    """What the text sync-back records must be what ``load_json`` can revive.
+
+    ``_TEXT_TYPES`` gates ``_on_text_changed`` (a browser edit is merged into the registry);
+    ``_SUPPORTED_TYPES`` gates ``load_json``. A type in the first but not the second means edits
+    are faithfully recorded into an entry that the very next ``to_dict()``/``load_json()`` round
+    trip drops on the floor — silent data loss with no error anywhere. That is exactly what
+    happened to ``'Text'``, while ``'FabricText'`` — an export alias, *not* a key in Fabric
+    7.4.0's ``classRegistry`` — was accepted here and then threw in ``enlivenObjects``.
+    """
+    assert _TEXT_TYPES <= _SUPPORTED_TYPES, sorted(_TEXT_TYPES - _SUPPORTED_TYPES)
+
+
+async def test_every_type_the_api_can_create_survives_a_round_trip(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """Everything this package can put on a canvas must come back out of ``load_json``.
+
+    Derived from the public API (every ``add_*`` helper, plus every ``_TEXT_TYPES`` member via
+    ``add_object``) rather than from a copy of ``_SUPPORTED_TYPES``, so it fails when the
+    allow-list and what the package actually produces disagree.
+    """
+    await user.open('/')
+    c = canvas_page()
+    points = [{'x': 0, 'y': 0}, {'x': 10, 'y': 0}, {'x': 10, 'y': 10}]
+    c.add_rect()
+    c.add_circle()
+    c.add_ellipse()
+    c.add_line(0, 0, 10, 10)
+    c.add_polygon(points)
+    c.add_polyline(points)
+    c.add_path('M 0 0 L 10 10')
+    c.add_text('hi')
+    c.add_image('https://ok.example/a.png')
+    for type_ in sorted(_TEXT_TYPES):
+        c.add_object(type_, text='hi')
+    before = [o['type'] for o in c._objects.values()]
+    assert 'Text' in before                                       # the API really does emit it
+    snapshot = c.to_dict()
+    c.clear_objects()
+    c.load_json(snapshot)
+    assert [o['type'] for o in c._objects.values()] == before
+
+
+async def test_plain_text_survives_a_round_trip_with_its_text(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """``add_object('Text', ...)`` is what ``add_text``'s docstring points at, and it is also
+    what Fabric's own ``toJSON`` writes for plain text — so a third-party payload takes this
+    path too. The content, not just the type, has to survive."""
+    await user.open('/')
+    c = canvas_page()
+    c.add_object('Text', text='hello', left=3)
+    c.load_json(c.to_dict())
+    (obj,) = c._objects.values()
+    assert obj['type'] == 'Text' and obj['text'] == 'hello' and obj['left'] == 3
+
+
+async def test_load_json_drops_the_unregistered_fabrictext_name(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """``FabricText`` is the exported class name, not a ``classRegistry`` key: accepting it here
+    would let a payload pass server validation and then fail in ``enlivenObjects``."""
+    await user.open('/')
+    c = canvas_page()
+    c.load_json({'objects': [{'type': 'FabricText', 'text': 'x'}, {'type': 'Text', 'text': 'y'}]})
+    assert [o['type'] for o in c._objects.values()] == ['Text']
+
+
+async def test_load_json_validates_nested_image_sources(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """The scheme allow-list applies at every depth — Fabric revives a nested Image like any
+    other, so a top-level-only check leaves one hole in an otherwise uniform validation story."""
+    await user.open('/')
+    c = canvas_page()
+    c.load_json({'objects': [
+        {'type': 'Rect', 'clipPath': {'type': 'Image', 'src': 'javascript:alert(1)'}},   # dropped
+        {'type': 'Rect', 'clipPath': {'type': 'Image'}},                    # no src at all → dropped
+        {'type': 'Rect', 'clipPath': {'type': 'Group',                      # inside a list, deeper
+                                       'objects': [{'type': 'Image', 'src': 'ftp://x/y.png'}]}},
+        {'type': 'Image', 'src': 'https://ok.example/a.png',
+         'clipPath': {'type': 'Image', 'src': 'data:image/png;base64,AAA'}},          # both fine
+    ]})
+    (kept,) = c._objects.values()
+    assert kept['type'] == 'Image'
+    assert kept['clipPath']['crossOrigin'] == 'anonymous'   # nested images get add_image's default
+
+
+async def test_load_json_does_not_alias_the_payload(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """Entries are deep copies, so filling in nested defaults cannot write into the caller's
+    dict and later registry mutations cannot leak back out."""
+    await user.open('/')
+    c = canvas_page()
+    nested = {'type': 'Image', 'src': 'https://ok.example/c.png'}
+    payload = {'objects': [{'type': 'Rect', 'clipPath': nested}]}
+    c.load_json(payload)
+    (entry,) = c._objects.values()
+    assert 'crossOrigin' not in nested                    # the default landed on the copy only
+    entry['clipPath']['src'] = 'https://mutated.example/x.png'
+    assert nested['src'] == 'https://ok.example/c.png'
+
+
 async def test_load_json_clears_selection(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
     await user.open('/')
     c = canvas_page()
@@ -805,6 +906,26 @@ async def test_to_svg_awaits_the_http_result(user: User, canvas_page: Callable[[
     assert await c.to_svg(timeout=5) == '<svg>drawn</svg>'
     assert calls[0][0] == 'export_svg'
     assert not _pending_exports                        # token cleaned up
+
+
+async def test_export_timeout_bounds_the_wait_for_initialization(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """``timeout`` must cover the whole call, not just the wait for the browser's POST.
+
+    ``initialized()`` awaits ``client.connected()``, whose own default timeout is ``None`` — so
+    an export fired when no client will ever connect (a background task after the tab closed, or
+    a user-fixture test like this one) used to wait forever despite a documented timeout. The
+    elapsed-time assertion is what distinguishes the fix from the bug: both raise
+    ``asyncio.TimeoutError`` here, only one of them raises it at ``timeout``.
+    """
+    await user.open('/')
+    c = canvas_page()
+    assert not c.is_initialized                        # user fixture never runs JS
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(c.to_svg(timeout=0.2), timeout=10)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert elapsed < 2, f'to_svg(timeout=0.2) took {elapsed:.1f}s — the outer guard fired, not it'
 
 
 async def test_to_svg_surfaces_a_browser_side_export_failure(

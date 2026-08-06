@@ -22,7 +22,7 @@ _METHOD_NAME = re.compile(r'^[A-Za-z_$][\w$.]*$')
 
 _GEOMETRY_KEYS = frozenset({'left', 'top', 'scaleX', 'scaleY', 'angle',
                              'skewX', 'skewY', 'flipX', 'flipY', 'width', 'height'})
-_TEXT_TYPES = frozenset({'Textbox', 'IText', 'FabricText', 'Text'})
+_TEXT_TYPES = frozenset({'Textbox', 'IText', 'Text'})
 _PATH_KEYS = frozenset({'type', 'id', 'path', 'left', 'top', 'width', 'height',
                          'scaleX', 'scaleY', 'angle', 'fill', 'stroke', 'strokeWidth',
                          'strokeLineCap', 'strokeLineJoin', 'strokeMiterLimit', 'strokeDashArray'})
@@ -32,7 +32,16 @@ _MAX_PATH_BYTES = 256_000
 _MAX_JSON_BYTES = 1_000_000
 _MAX_OBJECTS = 1000
 _SUPPORTED_TYPES = frozenset({'Rect', 'Circle', 'Ellipse', 'Line', 'Polygon', 'Polyline',
-                              'Path', 'Textbox', 'IText', 'FabricText', 'Image'})
+                              'Path', 'Textbox', 'IText', 'Text', 'Image'})
+"""Types ``load_json`` will accept.
+
+Every name here must be a key in Fabric 7.4.0's ``classRegistry`` — that is what
+``enlivenObjects`` looks up in the browser, and a name that is not a key throws there instead of
+being caught by this allow-list. ``'Text'`` is the registered name for plain (non-editable) text
+and is what Fabric's own ``toJSON`` writes; ``'FabricText'`` is the *class* name and is **not**
+registered, so it must never appear here (see ``tests/test_canvas.py`` for the gate).
+"""
+_IMAGE_SRC_SCHEMES = ('https://', 'http://', 'data:image/')
 _MAX_EXPORT_BYTES = 64_000_000
 _EXPORT_PATH = '/_nicefabric/export/{token}'
 
@@ -109,6 +118,41 @@ async def _read_capped(request: Request) -> bytes | None:
             return None
         chunks.append(chunk)
     return b''.join(chunks)
+
+
+def _valid_image_src(src: Any) -> bool:
+    """The one place an ``Image`` source is judged — used at every nesting level."""
+    return isinstance(src, str) and src.startswith(_IMAGE_SRC_SCHEMES)
+
+
+def _clean_nested_images(entry: dict) -> bool:
+    """Apply the ``Image`` rules to every dict nested inside one ``load_json`` object.
+
+    An object's ``clipPath`` (or any other nested descriptor) may itself be an ``Image``, and
+    Fabric revives it exactly like a top-level one — so an unchecked nested ``src`` would be the
+    single hole in the scheme allow-list. Nested images that pass also get ``add_image``'s
+    ``crossOrigin`` default, since a nested cross-origin image taints the canvas just as
+    thoroughly as a top-level one.
+
+    :return: ``False`` if any nested ``Image`` has a disallowed ``src``, in which case the caller
+        drops the whole top-level object — the same outcome as a bad top-level ``src``.
+
+    Iterative rather than recursive so a deeply nested payload cannot exhaust the stack here
+    (``load_json`` has already converted the equivalent failure into ``ValueError`` upstream).
+    ``entry`` must be a private deep copy: this mutates nested dicts in place.
+    """
+    stack: list[Any] = [*entry.values()]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if node.get('type') == 'Image':
+                if not _valid_image_src(node.get('src')):
+                    return False
+                node.setdefault('crossOrigin', 'anonymous')
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return True
 
 
 def _clean_geometry(props: Any) -> dict:
@@ -411,6 +455,11 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
         specify ``crossOrigin`` gets ``'anonymous'`` (matching ``add_image``) — otherwise a
         cross-origin image taints the canvas and a later export hangs until its timeout.
 
+        Both ``Image`` rules apply at every nesting level, not just the top: an object whose
+        ``clipPath`` (or any other nested descriptor) is an ``Image`` with a disallowed ``src``
+        is dropped whole, and a nested ``Image`` that passes gets the same ``crossOrigin``
+        default. The stored objects are deep copies, so the registry never aliases ``data``.
+
         The size cap is enforced on UTF-8 bytes and applies to a ``dict`` payload exactly like a
         ``str`` one (measured via ``json.dumps``) — a single oversized field cannot skip it by
         arriving already parsed.
@@ -448,11 +497,13 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
             # dicts) would make the ``in`` test raise TypeError instead of dropping the object
             if not isinstance(type_, str) or type_ not in _SUPPORTED_TYPES:
                 continue
-            if type_ == 'Image':
-                src = obj.get('src')
-                if not isinstance(src, str) or not src.startswith(('https://', 'http://', 'data:image/')):
-                    continue
-            entry = dict(obj)
+            if type_ == 'Image' and not _valid_image_src(obj.get('src')):
+                continue
+            # deep, so the registry never aliases the caller's payload and ``_clean_nested_images``
+            # can safely fill in nested defaults
+            entry = copy.deepcopy(obj)
+            if not _clean_nested_images(entry):
+                continue
             if type_ == 'Image':
                 entry.setdefault('crossOrigin', 'anonymous')
             entry['id'] = uuid.uuid4().hex
@@ -467,17 +518,27 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
         The result travels over HTTP rather than the websocket because a browser→server socket
         message above ~1 MB closes the connection (engine.io's default cap, which NiceGUI does
         not raise), and any real PNG export is larger than that.
+
+        ``timeout`` bounds the *whole* call, waiting for the canvas to initialize included — the
+        wait for a client is exactly the case that can never end on its own (an export fired from
+        a background task after the tab closed, or from a test with no browser at all), so leaving
+        it outside the budget would make the documented timeout unenforceable precisely when it
+        matters. Raises ``asyncio.TimeoutError`` either way, as before.
         """
-        await self.initialized()
-        _ensure_export_route()
-        token = uuid.uuid4().hex
-        future: asyncio.Future = asyncio.get_running_loop().create_future()
-        _pending_exports[token] = future
-        try:
-            self.run_method(method, token, *args)
-            return await asyncio.wait_for(future, timeout)
-        finally:
-            _pending_exports.pop(token, None)
+        async def run() -> str:
+            await self.initialized()
+            _ensure_export_route()
+            token = uuid.uuid4().hex
+            future: asyncio.Future = asyncio.get_running_loop().create_future()
+            _pending_exports[token] = future
+            try:
+                self.run_method(method, token, *args)
+                return await future
+            finally:
+                # reached on cancellation too, so the outer timeout cannot leak a token
+                _pending_exports.pop(token, None)
+
+        return await asyncio.wait_for(run(), timeout)
 
     async def to_svg(self, timeout: float = 30) -> str:
         """Render the canvas to SVG source in the browser. Waits for the canvas to initialize."""

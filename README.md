@@ -183,6 +183,10 @@ Both wait for the canvas to initialize, then ask the browser to render. A browse
 (typically a canvas tainted by a cross-origin image) raises `RuntimeError` promptly instead of
 hanging until `timeout`.
 
+`timeout` bounds the **whole** call, including that wait for initialization — so an export fired
+from a background task after the tab closed (or from a test with no browser at all) raises
+`asyncio.TimeoutError` rather than waiting forever for a client that will never connect.
+
 ### Lifecycle and escape hatches
 
 | Member                                              | Notes                                                        |
@@ -381,8 +385,8 @@ Every limit exists because something breaks without it.
 | ----------------------------- | ----------------------------------------------------------------------------------------- | ---------------------------- |
 | `load_json` payload           | 1 MB (UTF-8 bytes, `dict` and `str` alike)                                                 | `ValueError`, canvas untouched |
 | `load_json` object count      | 1000                                                                                       | `ValueError`, canvas untouched |
-| `load_json` object types      | `Rect Circle Ellipse Line Polygon Polyline Path Textbox IText FabricText Image`             | object dropped silently       |
-| `load_json` image `src`       | `https://`, `http://`, `data:image/`                                                       | object dropped silently       |
+| `load_json` object types      | `Rect Circle Ellipse Line Polygon Polyline Path Textbox IText Text Image`                   | object dropped silently       |
+| `load_json` image `src`       | `https://`, `http://`, `data:image/` — at every nesting level (e.g. a `clipPath` image)     | object dropped silently       |
 | text sync-back                | 20 000 characters                                                                          | the edit is not recorded      |
 | free-drawn path sync-back     | 256 000 JSON *characters* (`len(json.dumps(obj))`, not bytes)                              | the path is not registered    |
 | export upload                 | 64 MB                                                                                      | `ValueError`                  |
@@ -390,7 +394,11 @@ Every limit exists because something breaks without it.
 
 `load_json` treats its input as untrusted — it typically comes from a file or an upload — and
 gives every object a freshly generated id, so a payload cannot choose or collide with registry
-keys.
+keys. Objects are stored as deep copies, so the registry never aliases the payload you passed in.
+
+The type names above are Fabric's own registered names — the ones its `toJSON` writes and its
+`enlivenObjects` looks up. Plain text is `Text`, **not** `FabricText` (that is the class name and
+is not registered); `add_text()` produces `Textbox`.
 
 **The asymmetry is real:** `to_dict()` and `to_json()` are *uncapped*. A canvas full of free-drawn
 paths can be saved and then refused on load. Always catch `ValueError` around `load_json`, as the
