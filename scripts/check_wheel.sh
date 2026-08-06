@@ -7,6 +7,7 @@ import sys, zipfile, tarfile
 p = sys.argv[1]
 names = zipfile.ZipFile(p).namelist() if p.endswith('.whl') else tarfile.open(p).getnames()
 assert any(n.endswith('lib/nicefabric.min.mjs') for n in names), f'{p}: bundle missing!'
+assert any(n.endswith('fabric_canvas.js') for n in names), f'{p}: component JS missing!'
 print(f'{p}: OK')
 EOF
 done
