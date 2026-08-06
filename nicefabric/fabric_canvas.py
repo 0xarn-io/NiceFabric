@@ -155,6 +155,72 @@ def _clean_nested_images(entry: dict) -> bool:
     return True
 
 
+def _clean_object(obj: Any) -> dict | None:
+    """Validate one untrusted object descriptor into a private, freshly-identified entry.
+
+    The single gate every browser- or file-originated object passes through (``load_json`` and
+    ``add_svg`` alike): allow-listed type, image ``src`` scheme at every nesting level, and an
+    id this side chose — so a payload can never pick or collide with a registry key.
+
+    :return: a deep copy ready to store, or ``None`` if the object must be dropped.
+    """
+    if not isinstance(obj, dict):
+        return None
+    type_ = obj.get('type')
+    # the isinstance guard is load-bearing: an unhashable value (JSON gives lists and
+    # dicts) would make the ``in`` test raise TypeError instead of dropping the object
+    if not isinstance(type_, str) or type_ not in _SUPPORTED_TYPES:
+        return None
+    if type_ == 'Image' and not _valid_image_src(obj.get('src')):
+        return None
+    # deep, so the registry never aliases the caller's payload and ``_clean_nested_images``
+    # can safely fill in nested defaults
+    entry = copy.deepcopy(obj)
+    if not _clean_nested_images(entry):
+        return None
+    if type_ == 'Image':
+        entry.setdefault('crossOrigin', 'anonymous')
+    entry['id'] = uuid.uuid4().hex
+    return entry
+
+
+def _clean_objects(objects: Any, *, budget: int) -> dict[str, dict]:
+    """Validate an untrusted list of object descriptors into a registry slice.
+
+    :param budget: how many objects the registry can still take (``_MAX_OBJECTS`` for a call
+        that replaces everything, less for one that appends). Checked before validation, on the
+        raw count, so a huge payload is refused rather than walked.
+    :raises ValueError: if ``objects`` is not a list or does not fit in ``budget``.
+    """
+    if not isinstance(objects, list):
+        raise ValueError(f'expected a list of objects, got {type(objects).__name__}')
+    if len(objects) > budget:
+        raise ValueError(f'{len(objects)} objects does not fit — the canvas holds at most '
+                         f'{_MAX_OBJECTS} and has room for {budget}')
+    fresh: dict[str, dict] = {}
+    for obj in objects:
+        entry = _clean_object(obj)
+        if entry is not None:
+            fresh[entry['id']] = entry
+    return fresh
+
+
+def _document_size(options: Any) -> tuple[float, float] | None:
+    """Read a parsed SVG document's dimensions out of Fabric's ``options``, or ``None``.
+
+    Fabric leaves them out entirely when the root element is not an ``<svg>`` (a document the
+    browser's XML parser rejected, say), and a document can also declare them as percentages —
+    all of which reach here as something that is not a usable number.
+    """
+    if not isinstance(options, dict):
+        return None
+    width, height = options.get('width'), options.get('height')
+    if any(not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v)
+           for v in (width, height)):
+        return None
+    return width, height
+
+
 def _clean_geometry(props: Any) -> dict:
     """Filter untrusted ``props`` down to well-typed geometry keys only.
 
@@ -224,6 +290,13 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
         self._props['background'] = background
         self._props['selection'] = selection
         self._objects: dict[str, dict] = {}
+        self.last_svg_size: tuple[float, float] | None = None
+        """Dimensions of the document parsed by the most recent successful ``add_svg``.
+
+        ``None`` before the first import, and after one whose document declared no usable
+        ``width``/``height``. See ``add_svg``: importing is at native size, and this is what a
+        caller needs to ``resize`` or scale afterwards.
+        """
         self._canvas_state: dict[str, Any] = {}
         self._selected: list[str] = []
         self.is_initialized = False
@@ -484,40 +557,81 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
             if size > _MAX_JSON_BYTES:
                 raise ValueError(f'payload exceeds {_MAX_JSON_BYTES} bytes')
         objects = data.get('objects', []) if isinstance(data, dict) else data
-        if not isinstance(objects, list):
-            raise ValueError(f'expected a list of objects, got {type(objects).__name__}')
-        if len(objects) > _MAX_OBJECTS:
-            raise ValueError(f'more than {_MAX_OBJECTS} objects')
-        fresh: dict[str, dict] = {}
-        for obj in objects:
-            if not isinstance(obj, dict):
-                continue
-            type_ = obj.get('type')
-            # the isinstance guard is load-bearing: an unhashable value (JSON gives lists and
-            # dicts) would make the ``in`` test raise TypeError instead of dropping the object
-            if not isinstance(type_, str) or type_ not in _SUPPORTED_TYPES:
-                continue
-            if type_ == 'Image' and not _valid_image_src(obj.get('src')):
-                continue
-            # deep, so the registry never aliases the caller's payload and ``_clean_nested_images``
-            # can safely fill in nested defaults
-            entry = copy.deepcopy(obj)
-            if not _clean_nested_images(entry):
-                continue
-            if type_ == 'Image':
-                entry.setdefault('crossOrigin', 'anonymous')
-            entry['id'] = uuid.uuid4().hex
-            fresh[entry['id']] = entry
+        # the whole registry is being replaced, so the full cap is available
+        fresh = _clean_objects(objects, budget=_MAX_OBJECTS)
         self._objects = fresh
         self._selected = []
         self.run_method('sync_objects', list(fresh.values()))
 
-    async def _export(self, method: str, *args: Any, timeout: float) -> str:
-        """Ask the browser to render an export and wait for it to POST the result back.
+    async def add_svg(self, svg: str, *, timeout: float = 30) -> list[FabricObject]:
+        """Import an SVG document as ordinary canvas objects and return handles to them.
 
-        The result travels over HTTP rather than the websocket because a browser→server socket
-        message above ~1 MB closes the connection (engine.io's default cap, which NiceGUI does
-        not raise), and any real PNG export is larger than that.
+        Fabric's SVG parser needs the browser's ``DOMParser``, so this is a round trip: the
+        source goes out, the parsed shapes come back and are registered here. **It therefore
+        needs a connected client** — call it from a button handler or an ``on_connect``
+        callback, never from a page-builder body, where no browser exists yet and the call can
+        only run out its ``timeout``. Every other ``add_*`` is fire-and-forget and has no such
+        requirement.
+
+        What lands in the registry is a *flat* list of ordinary objects — ``Path``, ``Rect``,
+        ``Circle``, … — appended to whatever is already on the canvas. Fabric bakes each
+        element's accumulated parent transforms into absolute ``left``/``top``/``scaleX``/…
+        values and discards ``<g>`` structure, so grouping is not preserved. The gain is that
+        imported shapes are indistinguishable from ones added by hand: they replay on
+        reconnect, survive ``to_dict`` → ``load_json``, and can be selected and edited
+        individually.
+
+        Import is at **native size** — the canvas is not resized and nothing is scaled to fit.
+        ``last_svg_size`` holds the parsed document's dimensions afterwards, so the caller can
+        do either::
+
+            objects = await canvas.add_svg(source)
+            if canvas.last_svg_size:
+                canvas.resize(*(round(v) for v in canvas.last_svg_size))
+
+        The parsed shapes arrive from the browser and are treated exactly as untrusted as a
+        ``load_json`` payload: allow-listed types only, image sources restricted by scheme at
+        every nesting level, and freshly generated ids.
+
+        :param svg: SVG source. Capped at ``_MAX_JSON_BYTES`` UTF-8 bytes, like ``load_json``'s.
+        :param timeout: bounds the *whole* call, the wait for a client included.
+        :return: handles to the shapes that were registered — empty if the document held none.
+            A document the browser's XML parser rejects is not distinguishable from an empty
+            one at Fabric's boundary (both parse to zero objects), so both return ``[]`` and
+            leave the canvas untouched rather than raising.
+        :raises ValueError: if the source is oversized, the browser's answer is malformed, or
+            the shapes would take the registry past ``_MAX_OBJECTS`` — in which case nothing is
+            registered.
+        :raises RuntimeError: if the parse failed in the browser.
+        :raises asyncio.TimeoutError: if the whole round trip does not finish within ``timeout``.
+        """
+        if len(svg.encode('utf-8')) > _MAX_JSON_BYTES:
+            raise ValueError(f'SVG source exceeds {_MAX_JSON_BYTES} bytes')
+        payload = await self._export('import_svg', svg, timeout=timeout)
+        try:
+            # RecursionError included for the same reason load_json converts it: the endpoint
+            # that produced this body is public, so a pathological payload must not escape the
+            # documented ``ValueError`` contract
+            parsed = json.loads(payload)
+        except (ValueError, RecursionError) as e:
+            raise ValueError(f'the browser returned a malformed import result: {e}') from e
+        if not isinstance(parsed, dict):
+            raise ValueError(f'expected an import result, got {type(parsed).__name__}')
+        # counted against what is already registered: the cap is on the canvas, not on one call
+        fresh = _clean_objects(parsed.get('objects'), budget=_MAX_OBJECTS - len(self._objects))
+        self.last_svg_size = _document_size(parsed.get('options'))
+        self._objects.update(fresh)
+        if fresh:
+            self.run_method('add_objects', list(fresh.values()))
+        return [FabricObject(self, id_) for id_ in fresh]
+
+    async def _export(self, method: str, *args: Any, timeout: float) -> str:
+        """Run one browser-side job and wait for it to POST its result back.
+
+        Used by the exports and by ``add_svg``'s parse — jobs whose result is a document rather
+        than a status. That result travels over HTTP rather than the websocket because a
+        browser→server socket message above ~1 MB closes the connection (engine.io's default
+        cap, which NiceGUI does not raise), and any real PNG export is larger than that.
 
         ``timeout`` bounds the *whole* call, waiting for the canvas to initialize included — the
         wait for a client is exactly the case that can never end on its own (an export fired from

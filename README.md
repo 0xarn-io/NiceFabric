@@ -132,6 +132,71 @@ Every `add_*` returns a `FabricObject` handle. `**props` are Fabric-native camel
 | `add_image(url, **props)`                      | `Image`; `crossOrigin` defaults to `'anonymous'`       |
 | `add_object(type_, **props)`                   | any Fabric type by name, e.g. `add_object('IText', text='hi')` |
 
+`await add_svg(svg, timeout=30)` imports a whole SVG document and also returns handles, but it
+is a coroutine with different rules — see [Importing SVG](#importing-svg-async).
+
+### Importing SVG (async)
+
+| Method                                       | Notes                                                             |
+| -------------------------------------------- | ----------------------------------------------------------------- |
+| `await add_svg(svg, timeout=30) -> list[FabricObject]` | parses `svg` in the browser and appends the shapes    |
+| `last_svg_size: tuple[float, float] \| None`  | dimensions of the last parsed document, `None` if it declared none |
+
+**It needs a connected client.** Fabric's SVG parser runs on the browser's `DOMParser`, so this
+is a round trip: put it in a button handler or an `on_connect` callback, never in a page-builder
+body — there is no browser there yet, and the call can only run out its `timeout` (which bounds
+the *whole* call, the wait for a client included). Every other `add_*` is fire-and-forget and
+has no such requirement.
+
+```python
+async def import_drawing() -> None:
+    try:
+        objects = await canvas.add_svg(Path('logo.svg').read_text())
+    except (ValueError, RuntimeError, asyncio.TimeoutError) as e:
+        ui.notify(f'import failed: {e}', type='negative')
+        return
+    ui.notify(f'imported {len(objects)} shapes at {canvas.last_svg_size}')
+
+
+ui.button('Import SVG', on_click=import_drawing)
+```
+
+**The result is flat: `<g>` structure is not preserved.** Fabric's parser bakes each element's
+accumulated parent transforms into absolute `left`/`top`/`scaleX`/`angle`/… values and discards
+the groups themselves — so a `<g transform="translate(100, 40)">` moves its children rather than
+surviving as an object. What you get back is ordinary shapes (`Path`, `Rect`, `Circle`, …) that
+are indistinguishable from ones you added by hand: they replay on reconnect, survive
+`to_dict()` → `load_json()`, and are individually selectable and editable.
+
+**Import is at native size.** The canvas is not resized and nothing is scaled to fit — both
+would be lossy surprises. `last_svg_size` holds the parsed document's dimensions, so you can do
+either yourself:
+
+```python
+objects = await canvas.add_svg(source)
+if canvas.last_svg_size:
+    width, height = canvas.last_svg_size
+    canvas.resize(round(width), round(height))                  # fit the canvas to the document
+    # ...or fit the document to the canvas:
+    # scale = min(800 / width, 450 / height)
+    # for obj in objects:
+    #     p = obj.props
+    #     obj.update(left=p['left'] * scale, top=p['top'] * scale,
+    #                scaleX=p.get('scaleX', 1) * scale, scaleY=p.get('scaleY', 1) * scale)
+```
+
+Failure modes, all of which leave the registry untouched:
+
+| Situation                                              | Result                                       |
+| ------------------------------------------------------ | -------------------------------------------- |
+| source over 1 MB, or more shapes than the canvas cap    | `ValueError` (nothing is sent or registered) |
+| a document the browser's XML parser rejects             | `[]` — indistinguishable from an empty document at Fabric's boundary |
+| an `<image>` the browser cannot load                    | `RuntimeError`: Fabric 7.4.0 fails the *whole* parse, not just that element |
+| no client connects within `timeout`                     | `asyncio.TimeoutError`                       |
+
+Parsed shapes are treated as untrusted, exactly like a `load_json` payload: allow-listed types,
+the image `src` scheme allow-list at every nesting level, and freshly generated ids.
+
 ### Mutating objects
 
 | Method                                   | Notes                                                       |
@@ -374,8 +439,9 @@ This only bites when you mix the two styles. Consecutive fire-and-forget calls �
 every typed method (`add_rect`, `set_zoom`, `update_object`, …) issues — keep their order, both in
 flight and in the browser-side queue that applies them.
 
-`to_svg()` and `to_data_url()` are ordinary coroutines with their own 30 s default timeout, and
-they wait for canvas initialization internally — no `await initialized()` needed first.
+`to_svg()`, `to_data_url()` and `add_svg()` are ordinary coroutines with their own 30 s default
+timeout, and they wait for canvas initialization internally — no `await initialized()` needed
+first. They are also the only calls that *require* a browser: everything else works without one.
 
 ## Limits
 
@@ -385,6 +451,8 @@ Every limit exists because something breaks without it.
 | ----------------------------- | ----------------------------------------------------------------------------------------- | ---------------------------- |
 | `load_json` payload           | 1 MB (UTF-8 bytes, `dict` and `str` alike)                                                 | `ValueError`, canvas untouched |
 | `load_json` object count      | 1000                                                                                       | `ValueError`, canvas untouched |
+| `add_svg` source              | 1 MB (UTF-8 bytes), checked before anything is sent to the browser                          | `ValueError`, nothing is sent |
+| `add_svg` shape count         | the same 1000-object registry cap, counting what is already on the canvas                   | `ValueError`, canvas untouched |
 | `load_json` object types      | `Rect Circle Ellipse Line Polygon Polyline Path Textbox IText Text Image`                   | object dropped silently       |
 | `load_json` image `src`       | `https://`, `http://`, `data:image/` — at every nesting level (e.g. a `clipPath` image)     | object dropped silently       |
 | text sync-back                | 20 000 characters                                                                          | the edit is not recorded      |

@@ -62,6 +62,29 @@ _RED_PIXEL_PNG = base64.b64decode(
 DEMO_BACKGROUND = (248, 250, 252)     # '#f8fafc' from examples/main.py
 WHITE = (255, 255, 255)
 
+# The document the '/svg' probe page imports. Two of its three shapes are nested in a translated
+# <g>, which Fabric bakes into each object and then discards — so the registry must end up with
+# three flat objects at absolute positions. Fabric 7 positions from the CENTRE, so the expected
+# left/top below are shape centres: the rect's is (0+60/2, 0+40/2) + (100, 40), the circle's is
+# its (cx, cy) + (100, 40), and the untransformed triangle's is its bounding-box centre.
+SVG_SOURCE = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="220" height="140" viewBox="0 0 220 140">'
+    '<g transform="translate(100, 40)">'
+    '<rect x="0" y="0" width="60" height="40" fill="#ff0000"/>'
+    '<circle cx="20" cy="80" r="20" fill="#0000ff"/>'
+    '</g>'
+    '<path d="M 10 10 L 60 10 L 60 30 Z" fill="#00ff00"/>'
+    '</svg>')
+SVG_EXPECTED = [('Rect', 130, 60), ('Circle', 120, 120), ('Path', 35, 20)]
+# An <image> Fabric cannot load rejects the WHOLE parse (observed on 7.4.0: the parser
+# dereferences the null object it just failed to build). The data URL keeps that off the
+# network, so the failure is immediate and deterministic rather than a connection timeout.
+SVG_UNLOADABLE_IMAGE = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">'
+    '<image href="data:image/png;base64,notreallybase64" width="5" height="5"/>'
+    '<rect width="5" height="5"/></svg>')
+SVG_PIXELS = (3200, 5600)             # 60x40 rect + r=20 circle + a 500px triangle, ~4157 nominal
+
 # Overridable so CI can widen the budget for gates that depend on the ~2s init handshake
 # (window.socket.id poll + websocket connect) without editing code. 20s matches what has been
 # observed to be comfortable on an unloaded local machine.
@@ -143,6 +166,57 @@ def _probe_pages() -> None:
                 status.set_text(f'EXC {type(e).__name__}: {e}')
 
         ui.button('roundtrip', on_click=roundtrip).classes('roundtrip-btn')
+
+    @ui.page('/svg')
+    def svg_import() -> None:
+        """SVG import: browser-side parse -> HTTP POST -> the Python registry, then a round trip.
+
+        The document deliberately nests two of its three shapes in a translated ``<g>``: what
+        must land in the registry is three *flat* objects carrying absolute coordinates, since
+        Fabric bakes parent transforms in and throws the group away.
+        """
+        canvas = FabricCanvas(width=300, height=200, background='#ffffff',
+                              on_error=lambda e: errors.set_text(f'{errors.text} {e.args}'))
+        errors = ui.label('none').classes('errors')
+        status = ui.label('idle').classes('status')
+        dump = ui.label('-').classes('registry-dump')
+        ui.timer(0.2, lambda: dump.set_text(canvas.to_json()))
+
+        async def run(what: Callable[[], Any]) -> None:
+            status.set_text('running')
+            try:
+                status.set_text(await what())
+            except Exception as e:                                    # noqa: BLE001 - reported to the test
+                status.set_text(f'EXC {type(e).__name__}: {e}')
+
+        async def import_svg() -> str:
+            objects = await canvas.add_svg(SVG_SOURCE, timeout=20)
+            return (f'OK n={len(objects)} types={",".join(o.type for o in objects)} '
+                    f'size={canvas.last_svg_size}')
+
+        async def import_garbage() -> str:
+            """The judgment call under test: a document the XML parser rejects returns []."""
+            objects = await canvas.add_svg('<not-an-svg ka-boom', timeout=20)
+            return f'BAD n={len(objects)} size={canvas.last_svg_size} kept={len(canvas.to_dict()["objects"])}'
+
+        async def import_unloadable_image() -> str:
+            objects = await canvas.add_svg(SVG_UNLOADABLE_IMAGE, timeout=20)
+            return f'UNEXPECTED_OK n={len(objects)}'
+
+        async def roundtrip() -> str:
+            """to_dict() -> clear_objects() -> load_json(), comparing the rendered pixels."""
+            before_png = await canvas.to_data_url(timeout=20)
+            data = canvas.to_dict()
+            canvas.clear_objects()
+            canvas.load_json(data)
+            after_png = await canvas.to_data_url(timeout=20)
+            return (f'{"SAME" if before_png == after_png else "DIFF"} '
+                    f'n={len(canvas.to_dict()["objects"])}')
+
+        ui.button('import', on_click=lambda: run(import_svg)).classes('import-btn')
+        ui.button('garbage', on_click=lambda: run(import_garbage)).classes('garbage-btn')
+        ui.button('unloadable', on_click=lambda: run(import_unloadable_image)).classes('image-btn')
+        ui.button('roundtrip', on_click=lambda: run(roundtrip)).classes('roundtrip-btn')
 
     @ui.page('/export')
     def export() -> None:
@@ -717,6 +791,71 @@ def check_export_failure_path(probe: Probe) -> None:
     probe.assert_clean_console()   # the export failed, but it failed cleanly
 
 
+def check_svg_import_flattens_and_survives_roundtrip(probe: Probe) -> None:
+    """add_svg: parse in the browser -> flat, absolute objects in the registry -> round trip.
+
+    The whole claim of flattening in one check: what comes back from Fabric's parser is not a
+    group but three ordinary objects, they are painted, they carry absolute coordinates (so the
+    ``<g transform>`` really was baked in), and — because they are ordinary — they survive
+    ``to_dict`` -> ``clear_objects`` -> ``load_json`` pixel-for-pixel.
+    """
+    probe.open(f'{PROBE_URL}/svg')
+    wait_for_render(probe, WHITE, 0, 0, 'an empty canvas')
+    assert probe.registry() == []
+
+    previous = 'idle'
+
+    def click(selector: str, what: str) -> str:
+        """Click one button and return the status it produced.
+
+        Excluding the *previous* status matters as much as excluding 'running': the click's
+        websocket round trip can outlast a poll interval, and the stale value left by the step
+        before would otherwise be returned as if it were this step's result.
+        """
+        nonlocal previous
+        probe.page.locator(selector).click()
+        previous = wait_until(
+            lambda: (t := probe.text_of('.status')) not in ('running', previous) and t,
+            what, timeout=60)
+        return previous
+
+    status = click('.import-btn', 'the SVG import to finish')
+    assert status.startswith('OK n=3 types=Rect,Circle,Path'), status
+    assert 'size=(220, 140)' in status, f'the document dimensions were not reported: {status}'
+
+    objects = wait_until(lambda: probe.registry() or None, 'the parsed shapes in the registry',
+                         diagnose=probe.registry)
+    assert len(objects) == 3, objects
+    # flat: the <g> is gone, and nothing nested came through pretending to be a shape
+    assert all('objects' not in o for o in objects), objects
+    for (type_, left, top), obj in zip(SVG_EXPECTED, objects):
+        assert obj['type'] == type_, (obj, type_)
+        assert abs(obj['left'] - left) <= 3 and abs(obj['top'] - top) <= 3, (
+            f'{type_} should be at absolute ({left}, {top}) with the <g> transform baked in, '
+            f'got ({obj["left"]}, {obj["top"]})')
+    painted_before = wait_for_render(probe, WHITE, *SVG_PIXELS, 'the three imported shapes')
+    assert probe.text_of('.errors') == 'none', 'an imported shape failed to revive in the browser'
+
+    # a document the browser's XML parser rejects: [] and an untouched canvas, not an exception
+    bad = click('.garbage-btn', 'the malformed import to be reported')
+    assert bad == 'BAD n=0 size=None kept=3', bad
+    assert probe.painted_pixels(WHITE) == painted_before, 'the malformed import changed the canvas'
+
+    probe.assert_clean_console()      # before the step below, which makes the browser log a failure
+
+    # an <image> the browser cannot load fails the whole parse in Fabric 7.4.0 — that has to
+    # reach the caller as RuntimeError, with nothing half-imported behind it
+    unloadable = click('.image-btn', 'the unloadable-image import to be reported')
+    assert unloadable.startswith('EXC RuntimeError:'), unloadable
+    assert len(probe.registry()) == 3, 'a failed import must not leave shapes behind'
+    assert probe.painted_pixels(WHITE) == painted_before, 'the failed import changed the canvas'
+
+    result = click('.roundtrip-btn', 'the round trip to finish')
+    assert result == 'SAME n=3', f'imported shapes did not survive the round trip: {result}'
+    assert probe.painted_pixels(WHITE) == painted_before, 'the round trip changed the rendering'
+    assert probe.text_of('.errors') == 'none', 'a revived shape errored in the browser'
+
+
 CHECKS: list[Callable[[Probe], None]] = [
     check_demo_mounts_and_adds_shapes,
     check_demo_free_draw_reaches_python,
@@ -727,6 +866,7 @@ CHECKS: list[Callable[[Probe], None]] = [
     check_drawn_path_survives_roundtrip,
     check_export_success_path,
     check_export_failure_path,
+    check_svg_import_flattens_and_survives_roundtrip,
 ]
 
 
