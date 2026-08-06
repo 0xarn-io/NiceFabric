@@ -12,7 +12,7 @@ from nicegui.testing import User
 from starlette.requests import Request
 
 from nicefabric import FabricCanvas
-from nicefabric.fabric_canvas import (_EXPORT_PATH, _MAX_OBJECTS, _MAX_PATH_BYTES,
+from nicefabric.fabric_canvas import (_EXPORT_PATH, _MAX_JSON_BYTES, _MAX_OBJECTS, _MAX_PATH_BYTES,
                                        _pending_exports, _receive_export)
 
 
@@ -549,6 +549,35 @@ async def test_load_json_caps(user: User, canvas_page: Callable[[], FabricCanvas
     assert c._objects == {}                                       # nothing was applied
 
 
+async def test_load_json_size_cap_covers_the_dict_path(user: User,
+                                                        canvas_page: Callable[[], FabricCanvas]) -> None:
+    """A dict payload must not skip the size cap just because it was never a JSON string."""
+    await user.open('/')
+    c = canvas_page()
+    with pytest.raises(ValueError):
+        c.load_json({'objects': [{'type': 'Rect', 'text': 'x' * 2_000_000}]})
+    assert c._objects == {}
+
+
+async def test_load_json_size_cap_is_byte_accurate_not_char_accurate(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """A multi-byte-heavy string can be under the character cap yet over the byte cap.
+
+    The padding lives inside a valid JSON value (not appended as trailing garbage) so a
+    char-count-only cap would let ``json.loads`` succeed and load the object — the mutation this
+    test exists to catch, as opposed to merely tripping ``JSONDecodeError`` on malformed input.
+    """
+    await user.open('/')
+    c = canvas_page()
+    payload = json.dumps({'objects': [{'type': 'Rect', 'note': '\U0001f389' * 300_000}]},
+                          ensure_ascii=False)                # 4 UTF-8 bytes per emoji
+    assert len(payload) < _MAX_JSON_BYTES                    # character count alone looks fine
+    assert len(payload.encode('utf-8')) > _MAX_JSON_BYTES
+    with pytest.raises(ValueError):
+        c.load_json(payload)
+    assert c._objects == {}
+
+
 async def test_load_json_rejects_malformed_payloads(user: User,
                                                     canvas_page: Callable[[], FabricCanvas]) -> None:
     """Hostile input must raise ValueError, never TypeError or a partially applied registry."""
@@ -561,6 +590,18 @@ async def test_load_json_rejects_malformed_payloads(user: User,
     assert r.id in c._objects                                     # registry untouched
 
 
+async def test_load_json_converts_recursion_error_to_value_error(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """A pathologically nested payload must not leak json.loads's RecursionError past the
+    documented ``:raises ValueError:`` contract."""
+    await user.open('/')
+    c = canvas_page()
+    deeply_nested = '[' * 10_000 + ']' * 10_000
+    with pytest.raises(ValueError):
+        c.load_json(deeply_nested)
+    assert c._objects == {}
+
+
 async def test_load_json_drops_objects_with_an_unhashable_type(
         user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
     """JSON can carry a list or dict where a type name is expected — dropped, never a TypeError."""
@@ -569,6 +610,20 @@ async def test_load_json_drops_objects_with_an_unhashable_type(
     c.load_json(json.dumps({'objects': [{'type': ['Rect']}, {'type': {'a': 1}},
                                         {'type': None}, {'type': 'Rect'}]}))
     assert [o['type'] for o in c._objects.values()] == ['Rect']
+
+
+async def test_load_json_defaults_cross_origin_for_images(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """Matches add_image's default — an un-CORS'd image taints the canvas and hangs an export."""
+    await user.open('/')
+    c = canvas_page()
+    c.load_json({'objects': [
+        {'type': 'Image', 'src': 'https://ok.example/a.png'},
+        {'type': 'Image', 'src': 'https://ok.example/b.png', 'crossOrigin': 'use-credentials'},
+    ]})
+    a, b = c._objects.values()
+    assert a['crossOrigin'] == 'anonymous'
+    assert b['crossOrigin'] == 'use-credentials'          # the payload's own value is not overwritten
 
 
 async def test_load_json_clears_selection(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
@@ -585,12 +640,14 @@ async def test_load_json_clears_selection(user: User, canvas_page: Callable[[], 
 # attacker could send (unknown token, replay, oversized body, binary garbage).
 
 def _request(body: bytes, *, declared_length: int | None = None, chunk_size: int | None = None,
-             on_receive: Callable[[], Any] | None = None) -> tuple[Request, list[int]]:
+             on_receive: Callable[[], Any] | None = None,
+             query_string: bytes = b'') -> tuple[Request, list[int]]:
     """Build a real Starlette ``Request`` and a log of the chunk sizes actually consumed.
 
     :param declared_length: value for the ``content-length`` header (defaults to the real length)
     :param chunk_size: split the body into chunks of this size, as a chunked upload would arrive
     :param on_receive: called as each chunk is handed over, to interfere mid-upload
+    :param query_string: raw query string, e.g. ``b'error=1'`` to simulate a failed export
     """
     consumed: list[int] = []
     length = len(body) if declared_length is None else declared_length
@@ -605,7 +662,7 @@ def _request(body: bytes, *, declared_length: int | None = None, chunk_size: int
         return {'type': 'http.request', 'body': chunk, 'more_body': bool(chunks)}
 
     scope = {'type': 'http', 'method': 'POST', 'path': '/_nicefabric/export/t',
-             'query_string': b'', 'headers': [(b'content-length', str(length).encode())]}
+             'query_string': query_string, 'headers': [(b'content-length', str(length).encode())]}
     return Request(scope, receive), consumed
 
 
@@ -722,6 +779,15 @@ async def test_export_endpoint_rejects_non_utf8_body() -> None:
         await future
 
 
+async def test_export_endpoint_reports_a_browser_side_failure() -> None:
+    """A ``?error=1`` marker delivers the body as a RuntimeError instead of a result."""
+    future = _pend('tok')
+    request, _ = _request(b'canvas is tainted', query_string=b'error=1')
+    assert await _receive_export('tok', request) == {'ok': True}
+    with pytest.raises(RuntimeError, match='canvas is tainted'):
+        await future
+
+
 async def test_export_endpoint_keeps_concurrent_exports_apart() -> None:
     a, b = _pend('tok-a'), _pend('tok-b')
     request_b, _ = _request(b'B')
@@ -741,6 +807,18 @@ async def test_to_svg_awaits_the_http_result(user: User, canvas_page: Callable[[
     assert not _pending_exports                        # token cleaned up
 
 
+async def test_to_svg_surfaces_a_browser_side_export_failure(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """A failed browser-side export (e.g. a tainted canvas) fails fast instead of timing out."""
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    _post_from_fake_browser(c, b'canvas is tainted', failed=True)
+    with pytest.raises(RuntimeError, match='canvas is tainted'):
+        await c.to_svg(timeout=5)
+    assert not _pending_exports                        # token still cleaned up on failure
+
+
 async def test_to_data_url_passes_export_options(user: User,
                                                  canvas_page: Callable[[], FabricCanvas]) -> None:
     await user.open('/')
@@ -752,6 +830,38 @@ async def test_to_data_url_passes_export_options(user: User,
     name, args = calls[0]
     assert name == 'export_data_url'
     assert args[1] == {'format': 'jpeg', 'quality': 0.5, 'multiplier': 2.0}
+
+
+async def test_export_waits_for_init_before_calling_run_method(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """Pins the ``await self.initialized()`` guard in ``_export``: an export started before init
+    must not reach ``run_method`` until ``_handle_init`` fires — every other export test stubs
+    ``initialized()`` to be already-resolved, so deleting that line would leave them green."""
+    await user.open('/')
+    c = canvas_page()
+
+    async def _already_connected() -> None:
+        return None                            # isolates the test to the init-event half of the gate
+
+    c.client.connected = _already_connected    # type: ignore[method-assign]
+    export_calls: list[tuple] = []
+
+    def fake_run_method(name: str, *args: Any, timeout: float = 1) -> NullResponse:
+        export_calls.append((name, args))
+        if name == 'export_svg':
+            request, _ = _request(b'<svg/>')
+            asyncio.create_task(_receive_export(args[0], request))
+        return NullResponse()
+
+    c.run_method = fake_run_method             # type: ignore[method-assign]
+    task = asyncio.create_task(c.to_svg(timeout=5))
+    await asyncio.sleep(0.05)
+    assert export_calls == []                  # blocked on init — run_method never reached
+    assert not task.done()
+
+    c._handle_init()                           # unblocks initialized(); sync_objects also fires
+    assert await task == '<svg/>'
+    assert any(name == 'export_svg' for name, _ in export_calls)
 
 
 async def test_export_cleans_up_its_token_on_timeout(user: User,
@@ -770,14 +880,19 @@ async def _already_initialized() -> None:
     """Stand-in for ``FabricCanvas.initialized()``, which never resolves without a browser."""
 
 
-def _post_from_fake_browser(canvas: FabricCanvas, body: bytes) -> list[tuple[str, tuple]]:
-    """Make ``run_method`` behave like a browser: POST ``body`` back to the export endpoint."""
+def _post_from_fake_browser(canvas: FabricCanvas, body: bytes, *,
+                             failed: bool = False) -> list[tuple[str, tuple]]:
+    """Make ``run_method`` behave like a browser: POST ``body`` back to the export endpoint.
+
+    :param failed: simulate the JS export throwing (e.g. a tainted canvas) — posts with the
+        ``?error=1`` marker so the body is delivered as a ``RuntimeError`` instead of a result.
+    """
     calls: list[tuple[str, tuple]] = []
     posts: list[asyncio.Task] = []          # keeps the tasks alive until they finish
 
     def fake_run_method(name: str, *args: Any, timeout: float = 1) -> NullResponse:
         calls.append((name, args))
-        request, _ = _request(body)
+        request, _ = _request(body, query_string=b'error=1' if failed else b'')
         posts.append(asyncio.create_task(_receive_export(args[0], request)))
         return NullResponse()
 

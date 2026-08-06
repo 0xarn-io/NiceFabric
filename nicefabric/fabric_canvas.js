@@ -175,16 +175,24 @@ export default {
         }
       });
     },
-    // exports go back over HTTP, not the socket: a >1 MB socket message closes the connection
+    // exports go back over HTTP, not the socket: a >1 MB socket message closes the connection.
+    // Only the canvas read (toDataURL/toSVG) needs the queue — it must see everything enqueued
+    // ahead of it — so the upload itself runs after `_enqueue` has already released the lock.
     export_data_url(token, opts) {
-      return this._enqueue(() => this._post_export(token, this.canvas.toDataURL(opts)));
+      return this._enqueue(() => this.canvas.toDataURL(opts)).then(
+        (body) => this._post_export(token, body),
+        (err) => this._post_export(token, String(err?.message ?? err), true),
+      );
     },
     export_svg(token) {
-      return this._enqueue(() => this._post_export(token, this.canvas.toSVG()));
+      return this._enqueue(() => this.canvas.toSVG()).then(
+        (body) => this._post_export(token, body),
+        (err) => this._post_export(token, String(err?.message ?? err), true),
+      );
     },
-    _post_export(token, body) {
-      return fetch((window.path_prefix || "") + "/_nicefabric/export/" + token,
-                   { method: "POST", body });
+    _post_export(token, body, failed = false) {
+      const url = (window.path_prefix || "") + "/_nicefabric/export/" + token + (failed ? "?error=1" : "");
+      return fetch(url, { method: "POST", body });
     },
     run_canvas_method(name, ...args) {
       return this._enqueue(() => this._run(this.canvas, name, args));

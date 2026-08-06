@@ -52,6 +52,11 @@ async def _receive_export(token: str, request: Request) -> dict:
     replayed or already-timed-out token is dropped without reading the body, and an oversized
     body is refused before it is retained. The token is the only credential — 122 bits of
     ``uuid4``, valid once, for at most one ``timeout`` window.
+
+    A ``?error=1`` query string marks a browser-side export failure (e.g. ``toDataURL`` throwing
+    on a tainted canvas — see ``add_image``/``load_json``'s ``crossOrigin`` defaults): the body is
+    then the error message, delivered to the caller as a ``RuntimeError`` instead of a result, so
+    a broken export fails fast instead of running out the clock on ``timeout``.
     """
     future = _pending_exports.pop(token, None)
     if future is None or future.done():
@@ -67,6 +72,10 @@ async def _receive_export(token: str, request: Request) -> dict:
     except UnicodeDecodeError:
         future.set_exception(ValueError('export payload is not valid UTF-8'))
         return {'ok': False}
+    if request.query_params.get('error'):
+        logger.warning('nicefabric: export failed in the browser: %s', text)
+        future.set_exception(RuntimeError(f'browser-side export failed: {text}'))
+        return {'ok': True}
     future.set_result(text)
     return {'ok': True}
 
@@ -398,15 +407,33 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
         Treats ``data`` as untrusted (it typically comes from a file or an upload): it is
         size-capped, dropped to an allow-listed set of types, image sources are restricted to
         http(s)/data-image URLs, and every object is given a freshly generated id so a caller
-        cannot choose (or collide with) a registry key.
+        cannot choose (or collide with) a registry key. An ``Image`` entry that does not already
+        specify ``crossOrigin`` gets ``'anonymous'`` (matching ``add_image``) — otherwise a
+        cross-origin image taints the canvas and a later export hangs until its timeout.
 
-        :raises ValueError: if the payload is malformed, over ``_MAX_JSON_BYTES`` or holds more
-            than ``_MAX_OBJECTS`` objects — in which case the canvas is left untouched
+        The size cap is enforced on UTF-8 bytes and applies to a ``dict`` payload exactly like a
+        ``str`` one (measured via ``json.dumps``) — a single oversized field cannot skip it by
+        arriving already parsed.
+
+        :raises ValueError: if the payload is malformed, over ``_MAX_JSON_BYTES`` bytes or holds
+            more than ``_MAX_OBJECTS`` objects — in which case the canvas is left untouched. A
+            pathologically deeply nested payload also raises ``ValueError`` (converted from the
+            stdlib's ``RecursionError``), so callers only ever need to handle one exception type.
         """
         if isinstance(data, str):
-            if len(data) > _MAX_JSON_BYTES:
+            if len(data.encode('utf-8')) > _MAX_JSON_BYTES:
                 raise ValueError(f'payload exceeds {_MAX_JSON_BYTES} bytes')
-            data = json.loads(data)                  # JSONDecodeError is a ValueError
+            try:
+                data = json.loads(data)              # JSONDecodeError is a ValueError
+            except RecursionError as e:
+                raise ValueError('payload is too deeply nested') from e
+        else:
+            try:
+                size = len(json.dumps(data).encode('utf-8'))
+            except (RecursionError, TypeError) as e:
+                raise ValueError(f'payload could not be measured: {e}') from e
+            if size > _MAX_JSON_BYTES:
+                raise ValueError(f'payload exceeds {_MAX_JSON_BYTES} bytes')
         objects = data.get('objects', []) if isinstance(data, dict) else data
         if not isinstance(objects, list):
             raise ValueError(f'expected a list of objects, got {type(objects).__name__}')
@@ -426,6 +453,8 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
                 if not isinstance(src, str) or not src.startswith(('https://', 'http://', 'data:image/')):
                     continue
             entry = dict(obj)
+            if type_ == 'Image':
+                entry.setdefault('crossOrigin', 'anonymous')
             entry['id'] = uuid.uuid4().hex
             fresh[entry['id']] = entry
         self._objects = fresh
