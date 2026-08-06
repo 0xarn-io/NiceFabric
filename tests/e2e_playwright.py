@@ -62,6 +62,11 @@ _RED_PIXEL_PNG = base64.b64decode(
 DEMO_BACKGROUND = (248, 250, 252)     # '#f8fafc' from examples/main.py
 WHITE = (255, 255, 255)
 
+# Overridable so CI can widen the budget for gates that depend on the ~2s init handshake
+# (window.socket.id poll + websocket connect) without editing code. 20s matches what has been
+# observed to be comfortable on an unloaded local machine.
+E2E_TIMEOUT = float(os.environ.get('E2E_TIMEOUT', '20'))
+
 
 # --------------------------------------------------------------------------- probe server
 
@@ -145,6 +150,9 @@ def _probe_pages() -> None:
         canvas = FabricCanvas(width=400, height=300, background='#ffffff')
         canvas.add_rect(left=50, top=60, width=100, height=80, fill='#ff0000')
         result = ui.label('idle').classes('result')
+        # the full data URL, so the test can decode the PNG itself rather than trust a byte
+        # count; kept off the '.result' summary label to keep that one short and regex-friendly
+        raw_url = ui.label('').classes('raw-url')
 
         async def png() -> None:
             try:
@@ -153,10 +161,14 @@ def _probe_pages() -> None:
                 result.set_text(f'PNG prefix={url[:22]} magic={raw[:4].hex()} '
                                 f'size={int.from_bytes(raw[16:20], "big")}x'
                                 f'{int.from_bytes(raw[20:24], "big")} bytes={len(raw)}')
+                raw_url.set_text(url)
             except Exception as e:                                    # noqa: BLE001 - reported to the test
                 result.set_text(f'EXC {type(e).__name__}: {e}')
 
         async def svg() -> None:
+            # reset first: '.result' still holds the PNG summary from the button above, and the
+            # test needs a value it knows can only mean "the SVG click's own result is in"
+            result.set_text('idle')
             try:
                 src = await canvas.to_svg(timeout=20)
                 flat = src.replace(' ', '')
@@ -332,7 +344,7 @@ class Probe:
         assert not self.problems, f'browser reported: {self.problems}'
 
 
-def wait_until(condition: Callable[[], Any], what: str, timeout: float = 20,
+def wait_until(condition: Callable[[], Any], what: str, timeout: float = E2E_TIMEOUT,
                diagnose: Callable[[], Any] | None = None) -> Any:
     """Poll ``condition`` until it returns something truthy. Returns that value.
 
@@ -527,10 +539,25 @@ def check_multi_select_sync_on_cleared(probe: Probe) -> None:
 def check_multi_select_sync_on_updated(probe: Probe) -> None:
     """Same, but one member is shift-clicked out of a group that stays alive.
 
-    This is the branch the JS side's next-tick read and its ``!o.group`` guard exist for: the
-    blue rect leaves while the ActiveSelection is still there, so its ``left``/``top`` are
-    group-relative at the moment the event fires. Fabric does *not* take this path when another
-    object is clicked instead — that fires ``selection:cleared`` followed by ``created``.
+    This pins the JS side's member-coordinate sync to the ``selection:updated`` branch, not just
+    ``selection:cleared``: blue leaves the ActiveSelection and must come back with absolute
+    ``left``/``top`` while red, still selected, must NOT have been touched yet. Fabric does not
+    take this path when another object is clicked instead — that fires ``selection:cleared``
+    followed by ``created``.
+
+    What this does *not* pin down, despite appearances: the JS side also has a ``setTimeout(0)``
+    next-tick read and a ``!o.group`` guard, seemingly there to handle the moment blue leaves the
+    selection while its coordinates are still group-relative. Temporary instrumentation inside
+    ``syncDeselected`` on Fabric 7.4.0 showed that by the time either ``selection:cleared`` or
+    ``selection:updated`` actually fires, Fabric has already restored absolute coordinates and
+    already cleared ``o.group`` — the sync-time read and the next-tick read are identical
+    (observed: ``DBG sync-time group=false left=300 top=200``). Mutation-testing confirmed it:
+    replacing the ``setTimeout(0)`` with a synchronous read and dropping the ``!o.group`` guard
+    was NOT caught by this check, nor by ``check_multi_select_sync_on_cleared``. Those two details
+    are defensive against other Fabric versions where the event could plausibly fire before
+    coordinates are restored; a regression in either one would pass this suite silently. What is
+    actually under test here is narrower and still real: that the sync fires on deselection at
+    all, on the ``updated`` branch as well as ``cleared``.
     """
     box = _group_two_rects_and_drag(probe)
     page = probe.page
@@ -547,7 +574,13 @@ def check_multi_select_sync_on_updated(probe: Probe) -> None:
                       diagnose=probe.registry)[0]
     assert abs(blue['top'] - 200) <= 5, f'blue should be at absolute top 200: {blue}'
     # red is still in the group, so it must NOT have been synced yet
-    red = [r for r in probe.registry() if round(r['left']) == 100][0]
+    current = probe.registry()
+    reds = [r for r in current if round(r['left']) == 100]
+    # under the group-relative regression this check exists to catch, red's synced 'left' would
+    # read ~-100 (group-relative) instead of 100, so this list would be empty — report the whole
+    # registry rather than raising IndexError, which is precisely that regression in disguise
+    assert reds, f'no rect with left==100 found in registry: {current}'
+    red = reds[0]
     assert round(red['top']) == 100, f'red is still selected, nothing should have synced it: {red}'
 
     page.mouse.click(box['x'] + 550, box['y'] + 380)          # now drop red too
@@ -586,12 +619,41 @@ def check_drawn_path_survives_roundtrip(probe: Probe) -> None:
                         'the round trip to finish', timeout=60)
     assert status.startswith('SAME'), f'round trip did not render identically: {status}'
     assert ' n=1 ' in status, status
-    objects = probe.registry()
+    # guarded like the registry read at the top of _assert_dragged_pair_synced: a '-' placeholder
+    # or a dump caught mid-update raises JSONDecodeError instead of failing meaningfully
+    objects = wait_until(lambda: probe.registry() or None, 'the revived path in the registry',
+                         diagnose=probe.registry)
     assert len(objects) == 1 and objects[0]['type'] == 'Path', objects
     painted_after = probe.painted_pixels(WHITE)
     assert painted_after == painted_before, (painted_before, painted_after)
     assert probe.text_of('.errors') == 'none', 'an object failed to revive in the browser'
     probe.assert_clean_console()
+
+
+def _count_red_pixels(probe: Probe, data_url: str) -> int:
+    """Decode a PNG data URL in the browser and count pixels that are the demo's red fill.
+
+    Uses the browser's own PNG decoder (an offscreen ``<img>`` + canvas ``drawImage``), the same
+    approach ``painted_pixels`` uses on the live canvas — no new Python-side dependency needed.
+    """
+    return probe.page.evaluate(
+        """(url) => new Promise((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => {
+                const c = document.createElement('canvas');
+                c.width = img.naturalWidth;
+                c.height = img.naturalHeight;
+                const ctx = c.getContext('2d', {willReadFrequently: true});
+                ctx.drawImage(img, 0, 0);
+                const d = ctx.getImageData(0, 0, c.width, c.height).data;
+                let n = 0;
+                for (let i = 0; i < d.length; i += 4)
+                    if (d[i] > 200 && d[i + 1] < 80 && d[i + 2] < 80 && d[i + 3] > 200) n++;
+                resolve(n);
+            };
+            img.onerror = () => reject(new Error('failed to decode exported PNG'));
+            img.src = url;
+        })""", data_url)
 
 
 def check_export_success_path(probe: Probe) -> None:
@@ -600,10 +662,25 @@ def check_export_success_path(probe: Probe) -> None:
     probe.page.locator('.png-btn').click()
     png = wait_until(lambda: (t := probe.text_of('.result')) != 'idle' and t, 'the PNG export')
     assert png.startswith('PNG prefix=data:image/png;base64, magic=89504e47 size=400x300'), png
+    # bytes>1000 alone is not content-blind-proof: a blank 400x300 white PNG already measures
+    # ~925-1135 bytes, straddling that bound. Decode the PNG and require the red rect (drawn at
+    # left=50 top=60 width=100 height=80, Fabric's centre origin puts it at canvas (0,20)-(100,100)
+    # = 8000px nominal) to actually be there, not just "some bytes came back".
     assert int(re.search(r'bytes=(\d+)', png).group(1)) > 1000, png
+    data_url = wait_until(lambda: probe.text_of('.raw-url') or None, 'the exported PNG data url')
+    red_pixels = _count_red_pixels(probe, data_url)
+    assert red_pixels > 5000, f'red rect not found in exported PNG: red_pixels={red_pixels} ({png})'
 
+    before = png                                             # '.result' still shows the PNG summary
     probe.page.locator('.svg-btn').click()
-    svg = wait_until(lambda: (t := probe.text_of('.result')).startswith('SVG') and t, 'the SVG export')
+    # compares against 'idle' like the PNG wait above (the '/export' page resets '.result' to
+    # 'idle' before running the SVG export) so a failure surfaces the real 'EXC ...' message
+    # instead of a bare "last: False" the way ".startswith('SVG')" used to. Also excludes
+    # `before`: the click's websocket round trip can take longer than one poll interval, and the
+    # very first poll would otherwise still see the PNG summary (which is != 'idle') and return
+    # that stale value as if it were the SVG result.
+    svg = wait_until(lambda: (t := probe.text_of('.result')) not in ('idle', before) and t,
+                     'the SVG export')
     assert 'root=1' in svg and 'red=True' in svg, f'the red rect is missing from the SVG: {svg}'
     assert int(re.search(r'len=(\d+)', svg).group(1)) > 300, svg
     probe.assert_clean_console()
