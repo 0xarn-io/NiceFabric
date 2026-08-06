@@ -11,6 +11,8 @@ Fabric.js is vendored — no CDN, no network access needed at runtime.
 Not on PyPI yet — install from a clone:
 
 ```bash
+git clone https://github.com/0xarn-io/NiceFabric.git
+cd NiceFabric
 pip install .
 ```
 
@@ -42,6 +44,8 @@ def index() -> None:
 
 ui.run()
 ```
+
+Save as `app.py`, then run `python app.py`.
 
 A fuller demo — colour picker, delete-selected, PNG export, save/load — is in
 [`examples/main.py`](examples/main.py): `python examples/main.py`.
@@ -88,8 +92,9 @@ This changed in Fabric 6 and surprises everyone arriving from Fabric 5.
 ### 3. Awaited calls must be awaited immediately
 
 `await canvas.run_canvas_method('getZoom')` is fine; assigning the call to a variable and
-awaiting it on a later line raises `RuntimeError`. And an awaited call can overtake a
-fire-and-forget call issued just before it. See [Awaiting rules](#awaiting-rules).
+awaiting it works only until something else awaits first — once it does, the delayed `await`
+raises `RuntimeError`. And an awaited call can overtake a fire-and-forget call issued just before
+it. See [Awaiting rules](#awaiting-rules).
 
 ## API reference
 
@@ -188,8 +193,17 @@ hanging until `timeout`.
 | `run_object_method(obj_or_id, name, *args, timeout=1)` | call any Fabric object method                              |
 
 Both return NiceGUI's `AwaitableResponse`: ignore it to fire-and-forget, or `await` it
-immediately for the return value. Before the canvas is initialized they are dropped (the
-registry replay takes over) and awaiting yields `None`.
+immediately for the return value. Before the canvas is initialized, `run_method` hands back a
+`NullResponse` instead of sending anything — the call is silently **dropped and lost**, not
+queued. The registry replay described in [State model](#state-model) does *not* cover it: replay
+only re-sends `self._objects` and `self._canvas_state`, which is what the typed methods
+(`add_*`, `set_zoom`, …) write to, but `run_canvas_method`/`run_object_method` never touch either
+one. Awaiting the `NullResponse` yields `None`.
+
+`run_object_method` and `FabricObject.run_method` also differ from the typed mutators in another
+way: they resolve the target by id in JavaScript and simply return `undefined` if it is not
+found, so an unknown id is a **silent no-op**, not the `KeyError` that `update_object`,
+`remove_object` and friends raise (see [Mutating objects](#mutating-objects)).
 
 ### `FabricObject`
 
@@ -222,7 +236,9 @@ Handlers take one `GenericEventArguments`; the payload is in `e.args`.
 otherwise every programmatic add would echo back at you.
 
 The registry's own text sync is throttled to 5 updates per second; your `on_text_changed` handler
-is not, so it sees every keystroke event the browser sends.
+is not, so it sees every keystroke event the browser sends. `on_mouse_down`/`on_mouse_up` are
+unthrottled too — each one fires on every pointer press/release, so a handler doing real work
+should debounce or throttle itself.
 
 ## Prop convention
 
@@ -257,22 +273,34 @@ friends record the change server-side first, then message the browser.
   only covers the gap before the socket connects. Persistence is your app's job:
 
 ```python
-def save() -> None:
-    app.storage.general['canvas'] = canvas.to_dict()
-    ui.notify('saved')
+from nicegui import app, ui
 
-def load() -> None:
-    data = app.storage.general.get('canvas')
-    if data is None:
-        ui.notify('nothing saved yet')
-        return
-    try:
-        canvas.load_json(data)
-    except ValueError as e:
-        ui.notify(f'load failed: {e}', type='negative')
+from nicefabric import FabricCanvas
 
-ui.button('Save', on_click=save)
-ui.button('Load', on_click=load)
+
+@ui.page('/')
+def index() -> None:
+    canvas = FabricCanvas(width=800, height=450)
+
+    def save() -> None:
+        app.storage.general['canvas'] = canvas.to_dict()
+        ui.notify('saved')
+
+    def load() -> None:
+        data = app.storage.general.get('canvas')
+        if data is None:
+            ui.notify('nothing saved yet')
+            return
+        try:
+            canvas.load_json(data)
+        except ValueError as e:
+            ui.notify(f'load failed: {e}', type='negative')
+
+    ui.button('Save', on_click=save)
+    ui.button('Load', on_click=load)
+
+
+ui.run()
 ```
 
 Use `app.storage.user` for per-user state, `app.storage.general` for shared state, or write the
@@ -281,17 +309,31 @@ Use `app.storage.user` for per-user state, `app.storage.general` for shared stat
 ## Awaiting rules
 
 `run_canvas_method`, `run_object_method` and `FabricObject.run_method` return NiceGUI's
-`AwaitableResponse`. **It must be awaited immediately after creation, or not at all** — stashing
-one in a variable and awaiting it later raises
-`RuntimeError: AwaitableResponse must be awaited immediately after creation or not at all`.
+`AwaitableResponse`. **It must be awaited immediately after creation, or not at all.** "Immediately"
+is a statement about the event loop, not about which source line the `await` sits on: stashing the
+response in a variable and awaiting it on the very next line, with nothing else awaited in
+between, works — the fire-and-forget path hasn't had a chance to run yet. The moment *any* real
+`await` happens first — even `asyncio.sleep(0)` — the fire-and-forget path wins the race, and the
+delayed `await` then raises
+`RuntimeError: AwaitableResponse must be awaited immediately after creation or not at all`. That
+makes the anti-pattern worse than an outright bug: it works right up until something else in the
+same function starts awaiting things, then breaks.
 
 ```python
 async def measure() -> None:
     zoom = await canvas.run_canvas_method('getZoom')          # ✓ awaited immediately
     ui.notify(f'zoom is {zoom}')
 
-    pending = canvas.run_canvas_method('getZoom')             # ✗ don't do this
-    # await pending                                           #   -> RuntimeError
+    pending = canvas.run_canvas_method('getZoom')             # ✗ don't do this...
+    zoom = await pending                                      #   ...but this line alone works
+    ui.notify(f'zoom is {zoom} (works only because nothing awaited first)')
+
+    pending = canvas.run_canvas_method('getZoom')
+    await asyncio.sleep(0)                                    # any intervening await tips it over
+    try:
+        await pending                                         # -> RuntimeError, now that it's late
+    except RuntimeError as e:
+        ui.notify(f'as documented: {e}', type='negative')
 ```
 
 The default `timeout` is **1 second**. Raise it for anything slow:
@@ -342,7 +384,7 @@ Every limit exists because something breaks without it.
 | `load_json` object types      | `Rect Circle Ellipse Line Polygon Polyline Path Textbox IText FabricText Image`             | object dropped silently       |
 | `load_json` image `src`       | `https://`, `http://`, `data:image/`                                                       | object dropped silently       |
 | text sync-back                | 20 000 characters                                                                          | the edit is not recorded      |
-| free-drawn path sync-back     | 256 KB of JSON                                                                             | the path is not registered    |
+| free-drawn path sync-back     | 256 000 JSON *characters* (`len(json.dumps(obj))`, not bytes)                              | the path is not registered    |
 | export upload                 | 64 MB                                                                                      | `ValueError`                  |
 | websocket message             | ~1 MB (engine.io's default)                                                                | connection closes             |
 
@@ -356,8 +398,9 @@ recipe above does.
 
 The ~1 MB websocket cap is also why exports do not come back over the socket: `to_svg()` and
 `to_data_url()` have the browser POST the rendered result to a one-time-token HTTP endpoint
-instead. Any real PNG is larger than 1 MB, and an oversized socket message closes the connection
-outright.
+instead. Many real exports exceed 1 MB, and an oversized socket message would close the
+connection outright — but it doesn't matter either way, since exports always go over HTTP
+regardless of size.
 
 ## Security notes
 
@@ -393,6 +436,15 @@ not the `:`-argument evaluation above.
 
 Object props are passed through to Fabric untouched. If they come from users, validate them —
 particularly image `src` (`load_json` already restricts it, `add_image` does not).
+
+**Exports add a public, unauthenticated route.** `to_svg()`/`to_data_url()` register
+`POST /_nicefabric/export/{token}` so the browser can hand back the rendered result over HTTP
+instead of the websocket (see [Limits](#limits)). That route accepts requests from anyone, not
+just your page's own session — by design, since the browser POST carries no NiceGUI auth context.
+It's still narrow: `token` is a single-use 122-bit `uuid4`, popped from the pending-exports table
+before the body is even read, so a replayed, guessed or late token gets `{"ok": false}` without
+being processed further, and the body itself is read as a size-capped stream (see `export upload`
+in [Limits](#limits)) so an oversized POST is abandoned mid-flight rather than buffered.
 
 ## Sizing
 
