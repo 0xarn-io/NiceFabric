@@ -1,14 +1,19 @@
+import asyncio
 import json
-from typing import Callable
+import subprocess
+import sys
+from typing import Any, Callable
 
 import pytest
-from nicegui import ui
+from nicegui import app, ui
 from nicegui.awaitable_response import NullResponse
 from nicegui.events import GenericEventArguments
 from nicegui.testing import User
+from starlette.requests import Request
 
 from nicefabric import FabricCanvas
-from nicefabric.fabric_canvas import _MAX_PATH_BYTES
+from nicefabric.fabric_canvas import (_EXPORT_PATH, _MAX_OBJECTS, _MAX_PATH_BYTES,
+                                       _pending_exports, _receive_export)
 
 
 def _ev(canvas: FabricCanvas, args: dict) -> GenericEventArguments:
@@ -480,3 +485,291 @@ async def test_handle_init_replays_canvas_state(user: User, canvas_page: Callabl
         ('absolute_pan', (5, 6)),
         ('set_draw_mode', (True, {'color': '#ff0000', 'width': 3})),
     ]
+
+
+# --- serialization: computed server-side, never a browser round-trip ---
+
+async def test_to_dict_roundtrip_without_browser(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    c.add_rect(left=1)
+    c.add_text('hi')
+    snapshot = c.to_dict()
+    assert not c.is_initialized                     # no browser was ever involved
+    assert snapshot['version'] == '7.4.0'
+    assert len(snapshot['objects']) == 2
+    snapshot['objects'][0]['left'] = 99
+    assert list(c._objects.values())[0]['left'] == 1  # deep copy — no aliasing
+
+
+async def test_to_json_matches_to_dict(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    c.add_rect(left=1)
+    assert json.loads(c.to_json()) == c.to_dict()
+
+
+async def test_load_json_validates_and_assigns_fresh_ids(user: User,
+                                                         canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    c.load_json({'objects': [
+        {'type': 'Rect', 'id': 'attacker-chosen', 'left': 5},
+        {'type': 'Bogus'},                                        # unknown type → dropped
+        {'type': 'Image', 'src': 'javascript:alert(1)'},          # bad scheme → dropped
+        {'type': 'Image', 'src': 'https://ok.example/x.png'},
+        'not-a-dict',                                             # → dropped
+    ]})
+    objs = list(c._objects.values())
+    assert [o['type'] for o in objs] == ['Rect', 'Image']
+    assert all(o['id'] != 'attacker-chosen' and len(o['id']) == 32 for o in objs)
+    assert all(key == o['id'] for key, o in c._objects.items())   # registry keyed by the fresh id
+
+
+async def test_load_json_accepts_a_to_json_snapshot(user: User,
+                                                    canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    c.add_rect(left=7)
+    c.add_text('hi')
+    restored = c.to_json()
+    c.clear_objects()
+    c.load_json(restored)
+    assert [o['type'] for o in c._objects.values()] == ['Rect', 'Textbox']
+    assert list(c._objects.values())[0]['left'] == 7
+
+
+async def test_load_json_caps(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    with pytest.raises(ValueError):
+        c.load_json(json.dumps({'objects': []}) + ' ' * 2_000_000)
+    with pytest.raises(ValueError):
+        c.load_json({'objects': [{'type': 'Rect'}] * (_MAX_OBJECTS + 1)})
+    assert c._objects == {}                                       # nothing was applied
+
+
+async def test_load_json_rejects_malformed_payloads(user: User,
+                                                    canvas_page: Callable[[], FabricCanvas]) -> None:
+    """Hostile input must raise ValueError, never TypeError or a partially applied registry."""
+    await user.open('/')
+    c = canvas_page()
+    r = c.add_rect()
+    for payload in ['{not json', '5', '"a string"', {'objects': 5}, {'objects': 'a string'}]:
+        with pytest.raises(ValueError):
+            c.load_json(payload)
+    assert r.id in c._objects                                     # registry untouched
+
+
+async def test_load_json_clears_selection(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    a = c.add_rect()
+    c._on_selection(_ev(c, {'kind': 'created', 'ids': [a.id]}))
+    c.load_json({'objects': [{'type': 'Rect'}]})
+    assert c._selected == [] and a.id not in c._objects
+
+
+# --- HTTP export side-channel ---
+# The endpoint is a public, unauthenticated route: every test below feeds it what an
+# attacker could send (unknown token, replay, oversized body, binary garbage).
+
+def _request(body: bytes, *, declared_length: int | None = None, chunk_size: int | None = None,
+             on_receive: Callable[[], Any] | None = None) -> tuple[Request, list[int]]:
+    """Build a real Starlette ``Request`` and a log of the chunk sizes actually consumed.
+
+    :param declared_length: value for the ``content-length`` header (defaults to the real length)
+    :param chunk_size: split the body into chunks of this size, as a chunked upload would arrive
+    :param on_receive: called as each chunk is handed over, to interfere mid-upload
+    """
+    consumed: list[int] = []
+    length = len(body) if declared_length is None else declared_length
+    size = len(body) if chunk_size is None else chunk_size
+    chunks = [body[i:i + size] for i in range(0, len(body), size)] or [b'']
+
+    async def receive() -> dict:
+        if on_receive is not None:
+            on_receive()
+        chunk = chunks.pop(0) if chunks else b''
+        consumed.append(len(chunk))
+        return {'type': 'http.request', 'body': chunk, 'more_body': bool(chunks)}
+
+    scope = {'type': 'http', 'method': 'POST', 'path': '/_nicefabric/export/t',
+             'query_string': b'', 'headers': [(b'content-length', str(length).encode())]}
+    return Request(scope, receive), consumed
+
+
+def _pend(token: str) -> asyncio.Future:
+    future = asyncio.get_running_loop().create_future()
+    _pending_exports[token] = future
+    return future
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_exports():
+    """Every test must leave the process-wide pending-export table empty."""
+    yield
+    assert not _pending_exports, f'leaked pending exports: {list(_pending_exports)}'
+    _pending_exports.clear()
+
+
+def _export_route_present() -> bool:
+    return any(getattr(route, 'path', None) == _EXPORT_PATH for route in app.routes)
+
+
+def test_export_route_is_registered_at_import() -> None:
+    """Importing the package registers the route on ``nicegui.app``.
+
+    Checked in a subprocess: the NiceGUI test fixtures strip every non-``/_nicegui/`` route
+    before each test, so in-process this can only be observed on a fresh interpreter.
+    """
+    subprocess.run([sys.executable, '-c',
+                    'import nicefabric\n'
+                    'from nicegui import app\n'
+                    'assert any(str(getattr(r, "path", "")) == "/_nicefabric/export/{token}"\n'
+                    '           for r in app.routes)\n'], check=True, timeout=120)
+
+
+async def test_export_reinstates_a_route_that_was_stripped(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """An app under test loses the import-time route to ``nicegui_reset_globals``."""
+    await user.open('/')
+    c = canvas_page()
+    assert not _export_route_present()                 # the fixture removed it
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    _post_from_fake_browser(c, b'<svg/>')
+    await c.to_svg(timeout=5)
+    assert _export_route_present()
+    await c.to_svg(timeout=5)                          # re-adding is idempotent, not cumulative
+    assert len([r for r in app.routes if getattr(r, 'path', None) == _EXPORT_PATH]) == 1
+
+
+async def test_export_endpoint_resolves_the_pending_future() -> None:
+    future = _pend('tok')
+    request, _ = _request(b'<svg/>')
+    assert await _receive_export('tok', request) == {'ok': True}
+    assert await future == '<svg/>'
+    assert 'tok' not in _pending_exports          # consumed, one-time
+
+
+async def test_export_endpoint_ignores_unknown_token() -> None:
+    request, consumed = _request(b'x' * 100)
+    assert await _receive_export('never-issued', request) == {'ok': False}
+    assert consumed == []                         # body of an unknown token is never read
+
+
+async def test_export_endpoint_ignores_replayed_token() -> None:
+    future = _pend('tok')
+    first, _ = _request(b'first')
+    assert await _receive_export('tok', first) == {'ok': True}
+    second, consumed = _request(b'second')
+    assert await _receive_export('tok', second) == {'ok': False}
+    assert await future == 'first'                # the replay did not overwrite the result
+    assert consumed == []
+
+
+async def test_export_endpoint_ignores_timed_out_token() -> None:
+    """A POST arriving after the caller gave up must not raise InvalidStateError."""
+    future = _pend('tok')
+    future.cancel()
+    request, _ = _request(b'<svg/>')
+    assert await _receive_export('tok', request) == {'ok': False}
+
+
+async def test_export_endpoint_tolerates_a_timeout_mid_upload() -> None:
+    """The caller can give up between the token lookup and the last byte of the body."""
+    future = _pend('tok')
+    request, _ = _request(b'<svg/>', on_receive=future.cancel)
+    assert await _receive_export('tok', request) == {'ok': False}   # not an InvalidStateError
+
+
+async def test_export_endpoint_rejects_oversized_declared_body(monkeypatch: Any) -> None:
+    monkeypatch.setattr('nicefabric.fabric_canvas._MAX_EXPORT_BYTES', 10)
+    future = _pend('tok')
+    request, consumed = _request(b'x' * 50)
+    assert await _receive_export('tok', request) == {'ok': False}
+    assert consumed == []                         # rejected on content-length, body never retained
+    with pytest.raises(ValueError):
+        await future
+
+
+async def test_export_endpoint_stops_reading_an_oversized_stream(monkeypatch: Any) -> None:
+    """A lying content-length must not get the body past the cap either."""
+    monkeypatch.setattr('nicefabric.fabric_canvas._MAX_EXPORT_BYTES', 10)
+    future = _pend('tok')
+    request, consumed = _request(b'x' * 100, declared_length=1, chunk_size=5)
+    assert await _receive_export('tok', request) == {'ok': False}
+    assert sum(consumed) <= 15                    # stopped one chunk past the cap, not at 100 bytes
+    with pytest.raises(ValueError):
+        await future
+
+
+async def test_export_endpoint_rejects_non_utf8_body() -> None:
+    future = _pend('tok')
+    request, _ = _request(b'\xff\xfe\x00binary')
+    assert await _receive_export('tok', request) == {'ok': False}
+    with pytest.raises(ValueError):
+        await future
+
+
+async def test_export_endpoint_keeps_concurrent_exports_apart() -> None:
+    a, b = _pend('tok-a'), _pend('tok-b')
+    request_b, _ = _request(b'B')
+    request_a, _ = _request(b'A')
+    await _receive_export('tok-b', request_b)
+    await _receive_export('tok-a', request_a)
+    assert (await a, await b) == ('A', 'B')
+
+
+async def test_to_svg_awaits_the_http_result(user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    calls = _post_from_fake_browser(c, b'<svg>drawn</svg>')
+    assert await c.to_svg(timeout=5) == '<svg>drawn</svg>'
+    assert calls[0][0] == 'export_svg'
+    assert not _pending_exports                        # token cleaned up
+
+
+async def test_to_data_url_passes_export_options(user: User,
+                                                 canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    calls = _post_from_fake_browser(c, b'data:image/png;base64,AAA')
+    assert await c.to_data_url(format='jpeg', quality=0.5, multiplier=2.0,
+                               timeout=5) == 'data:image/png;base64,AAA'
+    name, args = calls[0]
+    assert name == 'export_data_url'
+    assert args[1] == {'format': 'jpeg', 'quality': 0.5, 'multiplier': 2.0}
+
+
+async def test_export_cleans_up_its_token_on_timeout(user: User,
+                                                     canvas_page: Callable[[], FabricCanvas]) -> None:
+    """A browser that never POSTs must not leak an entry in the process-wide table."""
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    c.run_method = lambda *a, **kw: NullResponse()     # type: ignore[method-assign]
+    with pytest.raises(asyncio.TimeoutError):
+        await c.to_svg(timeout=0.05)
+    assert not _pending_exports
+
+
+async def _already_initialized() -> None:
+    """Stand-in for ``FabricCanvas.initialized()``, which never resolves without a browser."""
+
+
+def _post_from_fake_browser(canvas: FabricCanvas, body: bytes) -> list[tuple[str, tuple]]:
+    """Make ``run_method`` behave like a browser: POST ``body`` back to the export endpoint."""
+    calls: list[tuple[str, tuple]] = []
+    posts: list[asyncio.Task] = []          # keeps the tasks alive until they finish
+
+    def fake_run_method(name: str, *args: Any, timeout: float = 1) -> NullResponse:
+        calls.append((name, args))
+        request, _ = _request(body)
+        posts.append(asyncio.create_task(_receive_export(args[0], request)))
+        return NullResponse()
+
+    canvas.run_method = fake_run_method                # type: ignore[method-assign]
+    return calls

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import math
@@ -9,6 +10,8 @@ import uuid
 import warnings
 from typing import Any
 
+from fastapi import Request
+from nicegui import app
 from nicegui.awaitable_response import AwaitableResponse, NullResponse
 from nicegui.element import Element
 from nicegui.events import GenericEventArguments, Handler
@@ -25,6 +28,78 @@ _PATH_KEYS = frozenset({'type', 'id', 'path', 'left', 'top', 'width', 'height',
                          'strokeLineCap', 'strokeLineJoin', 'strokeMiterLimit', 'strokeDashArray'})
 _MAX_TEXT_LEN = 20_000
 _MAX_PATH_BYTES = 256_000
+
+_MAX_JSON_BYTES = 1_000_000
+_MAX_OBJECTS = 1000
+_SUPPORTED_TYPES = frozenset({'Rect', 'Circle', 'Ellipse', 'Line', 'Polygon', 'Polyline',
+                              'Path', 'Textbox', 'IText', 'FabricText', 'Image'})
+_MAX_EXPORT_BYTES = 64_000_000
+_EXPORT_PATH = '/_nicefabric/export/{token}'
+
+_pending_exports: dict[str, asyncio.Future] = {}
+"""Exports awaiting their browser POST, keyed by one-time token.
+
+Process-wide (the route is registered once) but bounded: only ``_export`` adds entries and it
+always removes its own token in a ``finally``, so a client that never POSTs leaks nothing.
+"""
+
+
+@app.post(_EXPORT_PATH)
+async def _receive_export(token: str, request: Request) -> dict:
+    """Receive one rendered export from the browser and resolve the call waiting for it.
+
+    A public unauthenticated route, so every failure mode is a normal outcome: an unknown,
+    replayed or already-timed-out token is dropped without reading the body, and an oversized
+    body is refused before it is retained. The token is the only credential — 122 bits of
+    ``uuid4``, valid once, for at most one ``timeout`` window.
+    """
+    future = _pending_exports.pop(token, None)
+    if future is None or future.done():
+        return {'ok': False}
+    body = await _read_capped(request)
+    if future.done():           # the caller timed out while the body was arriving
+        return {'ok': False}
+    if body is None:
+        future.set_exception(ValueError(f'export exceeds {_MAX_EXPORT_BYTES} bytes'))
+        return {'ok': False}
+    try:
+        text = body.decode()
+    except UnicodeDecodeError:
+        future.set_exception(ValueError('export payload is not valid UTF-8'))
+        return {'ok': False}
+    future.set_result(text)
+    return {'ok': True}
+
+
+def _ensure_export_route() -> None:
+    """Re-add the export route if something removed it after import.
+
+    Registering once at import is enough for a normally-running app, but NiceGUI's own test
+    fixtures (``nicegui_reset_globals``, behind both ``user`` and ``screen``) delete every route
+    outside ``/_nicegui/`` between tests — without this, an app under test would POST its
+    exports at a 404 and every export would hang until its timeout.
+    """
+    if not any(getattr(route, 'path', None) == _EXPORT_PATH for route in app.routes):
+        app.post(_EXPORT_PATH)(_receive_export)
+
+
+async def _read_capped(request: Request) -> bytes | None:
+    """Read the request body, or return ``None`` if it exceeds ``_MAX_EXPORT_BYTES``.
+
+    Streamed rather than ``await request.body()`` so an oversized upload is abandoned mid-flight
+    instead of being buffered in full and measured afterwards.
+    """
+    declared = request.headers.get('content-length')
+    if declared is not None and declared.isdigit() and int(declared) > _MAX_EXPORT_BYTES:
+        return None
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > _MAX_EXPORT_BYTES:
+            return None
+        chunks.append(chunk)
+    return b''.join(chunks)
 
 
 def _clean_geometry(props: Any) -> dict:
@@ -304,6 +379,86 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
         """Remove all canvas objects (NiceGUI child elements are untouched — see ``clear``)."""
         self._objects.clear()
         self.run_method('clear')
+
+    def to_dict(self) -> dict:
+        """Snapshot the canvas as plain data, computed from the server-side registry.
+
+        Never a browser round-trip: Python is authoritative, so this works before init, in a
+        background task and in tests where no browser exists. The copy is deep — mutating the
+        result cannot reach into the registry.
+        """
+        return {'version': '7.4.0', 'objects': copy.deepcopy(list(self._objects.values()))}
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict())
+
+    def load_json(self, data: str | dict) -> None:
+        """Replace every canvas object with the contents of ``data``.
+
+        Treats ``data`` as untrusted (it typically comes from a file or an upload): it is
+        size-capped, dropped to an allow-listed set of types, image sources are restricted to
+        http(s)/data-image URLs, and every object is given a freshly generated id so a caller
+        cannot choose (or collide with) a registry key.
+
+        :raises ValueError: if the payload is malformed, over ``_MAX_JSON_BYTES`` or holds more
+            than ``_MAX_OBJECTS`` objects — in which case the canvas is left untouched
+        """
+        if isinstance(data, str):
+            if len(data) > _MAX_JSON_BYTES:
+                raise ValueError(f'payload exceeds {_MAX_JSON_BYTES} bytes')
+            data = json.loads(data)                  # JSONDecodeError is a ValueError
+        objects = data.get('objects', []) if isinstance(data, dict) else data
+        if not isinstance(objects, list):
+            raise ValueError(f'expected a list of objects, got {type(objects).__name__}')
+        if len(objects) > _MAX_OBJECTS:
+            raise ValueError(f'more than {_MAX_OBJECTS} objects')
+        fresh: dict[str, dict] = {}
+        for obj in objects:
+            if not isinstance(obj, dict) or obj.get('type') not in _SUPPORTED_TYPES:
+                continue
+            if obj.get('type') == 'Image':
+                src = obj.get('src')
+                if not isinstance(src, str) or not src.startswith(('https://', 'http://', 'data:image/')):
+                    continue
+            entry = dict(obj)
+            entry['id'] = uuid.uuid4().hex
+            fresh[entry['id']] = entry
+        self._objects = fresh
+        self._selected = []
+        self.run_method('sync_objects', list(fresh.values()))
+
+    async def _export(self, method: str, *args: Any, timeout: float) -> str:
+        """Ask the browser to render an export and wait for it to POST the result back.
+
+        The result travels over HTTP rather than the websocket because a browser→server socket
+        message above ~1 MB closes the connection (engine.io's default cap, which NiceGUI does
+        not raise), and any real PNG export is larger than that.
+        """
+        await self.initialized()
+        _ensure_export_route()
+        token = uuid.uuid4().hex
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        _pending_exports[token] = future
+        try:
+            self.run_method(method, token, *args)
+            return await asyncio.wait_for(future, timeout)
+        finally:
+            _pending_exports.pop(token, None)
+
+    async def to_svg(self, timeout: float = 30) -> str:
+        """Render the canvas to SVG source in the browser. Waits for the canvas to initialize."""
+        return await self._export('export_svg', timeout=timeout)
+
+    async def to_data_url(self, format: str = 'png', quality: float = 1.0,  # noqa: A002
+                          multiplier: float = 1.0, timeout: float = 30) -> str:
+        """Render the canvas to a data URL in the browser. Waits for the canvas to initialize.
+
+        An image added from a cross-origin URL that does not allow CORS taints the canvas and
+        makes the browser refuse the export (see ``add_image``, which requests CORS by default).
+        """
+        return await self._export('export_data_url',
+                                  {'format': format, 'quality': quality, 'multiplier': multiplier},
+                                  timeout=timeout)
 
     def set_background(self, color: str) -> None:
         self._canvas_state['background'] = color

@@ -175,6 +175,17 @@ export default {
         }
       });
     },
+    // exports go back over HTTP, not the socket: a >1 MB socket message closes the connection
+    export_data_url(token, opts) {
+      return this._enqueue(() => this._post_export(token, this.canvas.toDataURL(opts)));
+    },
+    export_svg(token) {
+      return this._enqueue(() => this._post_export(token, this.canvas.toSVG()));
+    },
+    _post_export(token, body) {
+      return fetch((window.path_prefix || "") + "/_nicefabric/export/" + token,
+                   { method: "POST", body });
+    },
     run_canvas_method(name, ...args) {
       return this._enqueue(() => this._run(this.canvas, name, args));
     },
