@@ -12,7 +12,8 @@ from nicegui.testing import User
 from starlette.requests import Request
 
 from nicefabric import FabricCanvas
-from nicefabric.fabric_canvas import (_EXPORT_PATH, _MAX_JSON_BYTES, _MAX_OBJECTS, _MAX_PATH_BYTES,
+from nicefabric.fabric_canvas import (_EXPORT_PATH, _MAX_EXPORT_BYTES, _MAX_JSON_BYTES,
+                                       _MAX_OBJECTS, _MAX_PATH_BYTES, _MAX_SVG_RESULT_BYTES,
                                        _SUPPORTED_TYPES, _TEXT_TYPES, _pending_exports,
                                        _receive_export)
 
@@ -603,6 +604,25 @@ async def test_load_json_converts_recursion_error_to_value_error(
     assert c._objects == {}
 
 
+async def test_load_json_converts_deepcopy_recursion_error_to_value_error(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """Distinct failure point from the ``json.loads`` test above: this payload is shallow enough
+    for ``json.dumps`` (used to measure a ``dict`` payload's size) to succeed, but nested deep
+    enough that ``copy.deepcopy`` inside ``_clean_objects``/``_clean_object`` overflows the
+    recursion limit. That must still surface as ``ValueError``, not leak past the documented
+    contract — this was reachable before ``_clean_objects`` wrapped its loop (see ``add_svg``'s
+    sibling test, which shares the same underlying fix)."""
+    await user.open('/')
+    c = canvas_page()
+    r = c.add_rect()
+    nested: Any = 'leaf'
+    for _ in range(600):
+        nested = [nested]
+    with pytest.raises(ValueError):
+        c.load_json({'objects': [{'type': 'Rect', 'junk': nested}]})
+    assert r.id in c._objects                                      # registry untouched
+
+
 async def test_load_json_drops_objects_with_an_unhashable_type(
         user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
     """JSON can carry a list or dict where a type name is expected — dropped, never a TypeError."""
@@ -1164,6 +1184,24 @@ async def test_add_svg_cap_counts_the_objects_already_on_the_canvas(
     assert len(c._objects) == _MAX_OBJECTS
 
 
+async def test_add_svg_negative_budget_message_is_sensible(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """``add_rect``/friends are uncapped, so the registry can already be past ``_MAX_OBJECTS``
+    by the time ``add_svg`` computes its budget as ``_MAX_OBJECTS - len(self._objects)`` — a
+    negative number. Even an *empty* import must not read as nonsense like 'has room for -3'."""
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    for _ in range(_MAX_OBJECTS + 3):
+        c.add_rect()
+    _import_from_fake_browser(c, _svg_payload([]))                 # empty — still over budget
+    with pytest.raises(ValueError) as exc_info:
+        await c.add_svg('<svg/>', timeout=5)
+    message = str(exc_info.value)
+    assert '-' not in message, message
+    assert str(_MAX_OBJECTS + 3) in message
+
+
 async def test_add_svg_rejects_an_oversized_source(user: User,
                                                    canvas_page: Callable[[], FabricCanvas]) -> None:
     """Refused in Python, before anything is sent to the browser."""
@@ -1205,6 +1243,44 @@ async def test_add_svg_rejects_a_hostile_browser_answer(
             await c.add_svg('<svg/>', timeout=5)
         assert c._objects == {}
     assert not _pending_exports
+
+
+async def test_add_svg_rejects_an_oversized_browser_answer(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """The parsed *answer* has its own cap, separate from and bigger than the source cap, and it
+    is enforced on raw bytes before ``json.loads``/``deepcopy`` ever see them — see
+    ``_MAX_SVG_RESULT_BYTES``. Without this check the only bound left is ``_MAX_EXPORT_BYTES``
+    (64 MB): this payload sits comfortably under that outer cap, so it proves the gap it closes.
+    """
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    oversized = json.dumps({'objects': [{'type': 'Rect'}],
+                            'options': {'padding': 'x' * (_MAX_SVG_RESULT_BYTES + 1)}}).encode()
+    assert _MAX_SVG_RESULT_BYTES < len(oversized) < _MAX_EXPORT_BYTES
+    _import_from_fake_browser(c, oversized)
+    with pytest.raises(ValueError, match=str(_MAX_SVG_RESULT_BYTES)):
+        await c.add_svg('<svg/>', timeout=5)
+    assert c._objects == {}
+    assert c.last_svg_size is None
+    assert not _pending_exports
+
+
+async def test_add_svg_converts_deepcopy_recursion_error_to_value_error(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """Same underlying fix as ``load_json``'s sibling test, exercised through ``add_svg``'s own
+    call site: a payload shallow enough to survive ``json.loads`` but deep enough to overflow
+    ``copy.deepcopy`` inside ``_clean_objects`` must still raise ``ValueError``."""
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    nested: Any = 'leaf'
+    for _ in range(600):
+        nested = [nested]
+    _import_from_fake_browser(c, _svg_payload([{'type': 'Rect', 'junk': nested}]))
+    with pytest.raises(ValueError):
+        await c.add_svg('<svg/>', timeout=5)
+    assert c._objects == {}
 
 
 async def test_add_svg_surfaces_a_browser_side_failure(

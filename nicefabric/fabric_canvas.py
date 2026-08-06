@@ -43,6 +43,22 @@ registered, so it must never appear here (see ``tests/test_canvas.py`` for the g
 """
 _IMAGE_SRC_SCHEMES = ('https://', 'http://', 'data:image/')
 _MAX_EXPORT_BYTES = 64_000_000
+_MAX_SVG_RESULT_BYTES = 20_000_000
+"""Cap on the browser's ``import_svg`` answer, enforced before ``json.loads``/``deepcopy``.
+
+Deliberately not ``_MAX_JSON_BYTES``: Fabric's SVG parser does not preserve source size, it
+expands it. A path's ``d`` attribute becomes an array of numbers, and the worst offender is the
+arc command — one ``A`` command (rx ry rot large-arc sweep x y, ~30 bytes) can lower to several
+cubic Bézier curves, each six JSON numbers wide. Measured against the vendored 7.4.0 bundle with
+legitimate, spec-valid documents at the ``_MAX_JSON_BYTES`` source boundary (dense polylines,
+hundreds of small shapes, arc-heavy paths), the worst observed blow-up was ~18x source size — a
+1 MB document producing an ~18 MB result. 20 MB leaves headroom above that measurement while
+staying well under ``_MAX_EXPORT_BYTES``, so a hostile 64 MB browser POST is still rejected by
+this check long before ``json.loads`` or the per-object ``deepcopy`` in ``_clean_objects`` ever
+see it — closing the gap that made the object-count cap (``_MAX_OBJECTS``) alone insufficient:
+that cap bounds how many objects land in the registry, not how many bytes the JSON blob those
+objects came from cost to parse and copy.
+"""
 _EXPORT_PATH = '/_nicefabric/export/{token}'
 
 _pending_exports: dict[str, asyncio.Future] = {}
@@ -189,19 +205,31 @@ def _clean_objects(objects: Any, *, budget: int) -> dict[str, dict]:
 
     :param budget: how many objects the registry can still take (``_MAX_OBJECTS`` for a call
         that replaces everything, less for one that appends). Checked before validation, on the
-        raw count, so a huge payload is refused rather than walked.
-    :raises ValueError: if ``objects`` is not a list or does not fit in ``budget``.
+        raw count, so a huge payload is refused rather than walked. Can be negative for an
+        appending caller whose registry is already past ``_MAX_OBJECTS`` — every ``add_*`` other
+        than ``add_svg`` is itself uncapped, so that is reachable even though appending never
+        exceeds the cap on its own.
+    :raises ValueError: if ``objects`` is not a list, does not fit in ``budget``, or nests deeply
+        enough that ``copy.deepcopy`` overflows the interpreter's recursion limit (converted from
+        ``RecursionError`` here so both callers of this function only ever need to catch
+        ``ValueError`` — see ``load_json`` and ``add_svg``).
     """
     if not isinstance(objects, list):
         raise ValueError(f'expected a list of objects, got {type(objects).__name__}')
     if len(objects) > budget:
+        if budget < 0:
+            raise ValueError(f'the canvas already holds {_MAX_OBJECTS - budget} objects — over '
+                             f'the {_MAX_OBJECTS} cap, so none of these {len(objects)} fit')
         raise ValueError(f'{len(objects)} objects does not fit — the canvas holds at most '
                          f'{_MAX_OBJECTS} and has room for {budget}')
     fresh: dict[str, dict] = {}
-    for obj in objects:
-        entry = _clean_object(obj)
-        if entry is not None:
-            fresh[entry['id']] = entry
+    try:
+        for obj in objects:
+            entry = _clean_object(obj)
+            if entry is not None:
+                fresh[entry['id']] = entry
+    except RecursionError as e:
+        raise ValueError('object is too deeply nested to copy') from e
     return fresh
 
 
@@ -291,11 +319,22 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
         self._props['selection'] = selection
         self._objects: dict[str, dict] = {}
         self.last_svg_size: tuple[float, float] | None = None
-        """Dimensions of the document parsed by the most recent successful ``add_svg``.
+        """Dimensions of the document parsed by the most recent ``add_svg`` call that did not
+        raise.
 
-        ``None`` before the first import, and after one whose document declared no usable
-        ``width``/``height``. See ``add_svg``: importing is at native size, and this is what a
-        caller needs to ``resize`` or scale afterwards.
+        ``None`` before the first import, after one whose document declared no usable
+        ``width``/``height`` — and also after one that imported nothing at all: a malformed
+        SVG and a genuinely empty one both return ``[]`` without raising (see ``add_svg``), and
+        both still overwrite this from whatever ``options`` the browser reported for them, so a
+        later malformed import silently clears the dimensions an earlier successful one left
+        here. Only a call that *raises* leaves it untouched.
+
+        Last-write-wins, with no lock: two ``add_svg`` calls awaited concurrently on the same
+        canvas race here, and whichever browser answer is processed second overwrites the
+        first's dimensions regardless of which call started or was awaited first.
+
+        See ``add_svg``: importing is at native size, and this is what a caller needs to
+        ``resize`` or scale afterwards.
         """
         self._canvas_state: dict[str, Any] = {}
         self._selected: list[str] = []
@@ -589,25 +628,36 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
             if canvas.last_svg_size:
                 canvas.resize(*(round(v) for v in canvas.last_svg_size))
 
-        The parsed shapes arrive from the browser and are treated exactly as untrusted as a
-        ``load_json`` payload: allow-listed types only, image sources restricted by scheme at
-        every nesting level, and freshly generated ids.
+        The browser's answer is untrusted the same way a ``load_json`` payload is, and goes
+        through the same gate (``_clean_objects``/``_clean_object``): allow-listed types only,
+        image sources restricted by scheme at every nesting level, and freshly generated ids.
+        Where it differs is size: the *answer* is capped at ``_MAX_SVG_RESULT_BYTES``, separately
+        from the ``_MAX_JSON_BYTES`` source cap and much larger than it, because Fabric's parser
+        expands source bytes rather than preserving them (see ``_MAX_SVG_RESULT_BYTES`` for the
+        measurement behind the number) — and that cap is enforced before the answer is even
+        parsed, let alone deep-copied into the registry, so an oversized answer costs one
+        ``len()`` call, not a 20 MB ``json.loads``.
 
         :param svg: SVG source. Capped at ``_MAX_JSON_BYTES`` UTF-8 bytes, like ``load_json``'s.
         :param timeout: bounds the *whole* call, the wait for a client included.
         :return: handles to the shapes that were registered — empty if the document held none.
             A document the browser's XML parser rejects is not distinguishable from an empty
             one at Fabric's boundary (both parse to zero objects), so both return ``[]`` and
-            leave the canvas untouched rather than raising.
-        :raises ValueError: if the source is oversized, the browser's answer is malformed, or
-            the shapes would take the registry past ``_MAX_OBJECTS`` — in which case nothing is
-            registered.
+            leave the object registry untouched rather than raising — though ``last_svg_size``
+            is still overwritten in that case (see its own docstring).
+        :raises ValueError: if the source is oversized, the browser's answer is over
+            ``_MAX_SVG_RESULT_BYTES``, is malformed, or the shapes would take the registry past
+            ``_MAX_OBJECTS`` — in which case nothing is registered.
         :raises RuntimeError: if the parse failed in the browser.
         :raises asyncio.TimeoutError: if the whole round trip does not finish within ``timeout``.
         """
         if len(svg.encode('utf-8')) > _MAX_JSON_BYTES:
             raise ValueError(f'SVG source exceeds {_MAX_JSON_BYTES} bytes')
         payload = await self._export('import_svg', svg, timeout=timeout)
+        # checked before json.loads/deepcopy ever see it — see _MAX_SVG_RESULT_BYTES
+        if len(payload.encode('utf-8')) > _MAX_SVG_RESULT_BYTES:
+            raise ValueError(f'the browser returned an import result over '
+                             f'{_MAX_SVG_RESULT_BYTES} bytes')
         try:
             # RecursionError included for the same reason load_json converts it: the endpoint
             # that produced this body is public, so a pathological payload must not escape the
