@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from typing import Any
 
 from nicegui.awaitable_response import AwaitableResponse, NullResponse
 from nicegui.element import Element
+from nicegui.events import GenericEventArguments
+
+logger = logging.getLogger(__name__)
 
 
 class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nicefabric.min.mjs']):
@@ -22,11 +26,18 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
         self.is_initialized = False
         self._init_event = asyncio.Event()
         self.on('init', self._handle_init)
+        self.on('object-error', self._handle_object_error)
 
     def _handle_init(self) -> None:
         self.is_initialized = True
         self._init_event.set()
         self.run_method('sync_objects', list(self._objects.values()))
+
+    def _handle_object_error(self, e: GenericEventArguments) -> None:
+        payload = e.args if isinstance(e.args, dict) else {}
+        object_id = payload.get('id', '<unknown>')
+        message = payload.get('message', '<no message>')
+        logger.warning('nicefabric: object %s failed to revive in the browser: %s', object_id, message)
 
     async def initialized(self) -> None:
         """Wait until the browser-side canvas exists (never resolves in user-fixture tests)."""

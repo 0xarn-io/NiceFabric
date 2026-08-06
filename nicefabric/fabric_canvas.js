@@ -16,13 +16,14 @@ export default {
       backgroundColor: this.background,
       selection: this.selection,
     });
-    const iv = setInterval(() => {
+    this._initInterval = setInterval(() => {
       if (window.socket.id === undefined) return;  // Leaflet handshake pattern
       this.$emit("init");
-      clearInterval(iv);
+      clearInterval(this._initInterval);
     }, 100);
   },
   beforeUnmount() {
+    clearInterval(this._initInterval);
     this.canvas?.dispose();  // async, but DOM cleanup is synchronous — safe fire-and-forget
   },
   methods: {
@@ -35,7 +36,11 @@ export default {
       );
       results.forEach((r, i) => {
         if (r.status === "fulfilled" && r.value) this.canvas.add(r.value);
-        else this.$emit("object-error", { id: objs[i].id, message: String(r.reason ?? "enliven failed") });
+        else {
+          const message = String(r.reason ?? "enliven failed");
+          console.error("nicefabric: failed to enliven object", objs[i].id, message);
+          this.$emit("object-error", { id: objs[i].id, message });
+        }
       });
       this.canvas.requestRenderAll();
     },
