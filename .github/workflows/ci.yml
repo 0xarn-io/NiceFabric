@@ -1,0 +1,62 @@
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '${{ matrix.python-version }}'
+      # `[dev]` brings pytest, pytest-asyncio (asyncio_mode = auto), playwright and build.
+      # `build` is what scripts/check_wheel.sh shells out to.
+      - run: pip install -e '.[dev]'
+      # ruff is deliberately NOT in `[dev]`: it is a lint-only tool, and pinning it here keeps a
+      # new ruff release (new default rules) from turning an untouched branch red. Bump on purpose.
+      - run: pip install ruff==0.15.8
+      - run: ruff check nicefabric tests examples
+      # `tests/` is unit tests only — e2e_playwright.py is not named test_*.py, so it is not
+      # collected here. It gets its own job below.
+      - run: pytest tests/ -q
+      # Packaging gate: builds the sdist and the wheel and asserts the vendored Fabric bundle
+      # (lib/nicefabric.min.mjs) and the component JS (fabric_canvas.js) are in both. Those are
+      # data files, not modules, so an ordinary import test would not catch losing them.
+      - run: bash scripts/check_wheel.sh
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -e '.[dev]'
+      # `--with-deps` installs the system libraries Chromium needs on a bare runner. Note that
+      # PLAYWRIGHT_BROWSERS_PATH is intentionally unset here, so playwright downloads the browser
+      # build matching whichever playwright version pip just resolved.
+      - run: playwright install --with-deps chromium
+      # The suite starts the demo (port 8080), a probe server (8611) and a cross-origin image
+      # server (8613), then drives Chromium. Standalone entry point, so all 9 checks run and are
+      # reported even after one fails. E2E_TIMEOUT widens the default 20s poll budget: a shared
+      # runner is slower and more contended than a developer box, and the gates it covers wait on
+      # the ~2s init handshake plus websocket round trips.
+      - run: python tests/e2e_playwright.py
+        env:
+          E2E_TIMEOUT: '60'
+          # The suite writes a screenshot per failed check to tempfile.gettempdir(). Pointing
+          # TMPDIR at the runner's temp dir makes that location knowable to the upload step below.
+          TMPDIR: ${{ runner.temp }}
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-screenshots
+          path: ${{ runner.temp }}/e2e-*.png
+          if-no-files-found: ignore
