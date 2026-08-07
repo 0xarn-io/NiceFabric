@@ -12,7 +12,8 @@ from nicegui.testing import User
 from starlette.requests import Request
 
 from nicefabric import FabricCanvas
-from nicefabric.fabric_canvas import (_EXPORT_PATH, _MAX_JSON_BYTES, _MAX_OBJECTS, _MAX_PATH_BYTES,
+from nicefabric.fabric_canvas import (_EXPORT_PATH, _MAX_EXPORT_BYTES, _MAX_JSON_BYTES,
+                                       _MAX_OBJECTS, _MAX_PATH_BYTES, _MAX_SVG_RESULT_BYTES,
                                        _SUPPORTED_TYPES, _TEXT_TYPES, _pending_exports,
                                        _receive_export)
 
@@ -603,6 +604,25 @@ async def test_load_json_converts_recursion_error_to_value_error(
     assert c._objects == {}
 
 
+async def test_load_json_converts_deepcopy_recursion_error_to_value_error(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """Distinct failure point from the ``json.loads`` test above: this payload is shallow enough
+    for ``json.dumps`` (used to measure a ``dict`` payload's size) to succeed, but nested deep
+    enough that ``copy.deepcopy`` inside ``_clean_objects``/``_clean_object`` overflows the
+    recursion limit. That must still surface as ``ValueError``, not leak past the documented
+    contract — this was reachable before ``_clean_objects`` wrapped its loop (see ``add_svg``'s
+    sibling test, which shares the same underlying fix)."""
+    await user.open('/')
+    c = canvas_page()
+    r = c.add_rect()
+    nested: Any = 'leaf'
+    for _ in range(600):
+        nested = [nested]
+    with pytest.raises(ValueError):
+        c.load_json({'objects': [{'type': 'Rect', 'junk': nested}]})
+    assert r.id in c._objects                                      # registry untouched
+
+
 async def test_load_json_drops_objects_with_an_unhashable_type(
         user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
     """JSON can carry a list or dict where a type name is expected — dropped, never a TypeError."""
@@ -1019,3 +1039,272 @@ def _post_from_fake_browser(canvas: FabricCanvas, body: bytes, *,
 
     canvas.run_method = fake_run_method                # type: ignore[method-assign]
     return calls
+
+
+# --- SVG import ---
+# `add_svg` sends the source to the browser, Fabric's parser runs there, and the parsed shapes
+# come back through the same one-time-token HTTP channel the exports use. Everything below is
+# the Python half: the browser is faked, and its answer is treated as hostile input, because a
+# parsed SVG is exactly as untrusted as a `load_json` payload.
+
+
+def _svg_payload(objects: list[dict], **options: Any) -> bytes:
+    """One import result as the browser would POST it back: parsed shapes plus Fabric's options."""
+    return json.dumps({'objects': objects, 'options': options}).encode()
+
+
+def _import_from_fake_browser(canvas: FabricCanvas, body: bytes, *,
+                              failed: bool = False) -> list[tuple[str, tuple]]:
+    """Make ``run_method`` answer an ``import_svg`` call by POSTing ``body`` back.
+
+    Unlike ``_post_from_fake_browser`` this answers *only* ``import_svg`` — ``add_svg`` also
+    issues an ``add_objects`` call afterwards, whose first argument is a list of objects rather
+    than an export token, and feeding that to the export endpoint would be nonsense.
+    """
+    calls: list[tuple[str, tuple]] = []
+    posts: list[asyncio.Task] = []          # keeps the tasks alive until they finish
+
+    def fake_run_method(name: str, *args: Any, timeout: float = 1) -> NullResponse:
+        calls.append((name, args))
+        if name == 'import_svg':
+            request, _ = _request(body, query_string=b'error=1' if failed else b'')
+            posts.append(asyncio.create_task(_receive_export(args[0], request)))
+        return NullResponse()
+
+    canvas.run_method = fake_run_method                # type: ignore[method-assign]
+    return calls
+
+
+async def test_add_svg_registers_parsed_shapes_and_returns_handles(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    calls = _import_from_fake_browser(c, _svg_payload(
+        [{'type': 'Rect', 'left': 10, 'top': 20}, {'type': 'Circle', 'left': 30, 'radius': 5}],
+        width=100, height=50))
+
+    handles = await c.add_svg('<svg/>', timeout=5)
+
+    assert [h.type for h in handles] == ['Rect', 'Circle']
+    assert [o['type'] for o in c._objects.values()] == ['Rect', 'Circle']
+    assert [h.props['left'] for h in handles] == [10, 30]        # absolute, as the parser baked them
+    assert [name for name, _ in calls] == ['import_svg', 'add_objects']
+    assert calls[0][1][1] == '<svg/>'                            # the source is sent as-is
+    assert calls[1][1][0] == list(c._objects.values())           # the browser gets the id-stamped copies
+    assert not _pending_exports
+
+
+async def test_add_svg_appends_with_fresh_ids(user: User,
+                                              canvas_page: Callable[[], FabricCanvas]) -> None:
+    """Imported shapes join the canvas — they do not replace it — and cannot choose their id."""
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    existing = c.add_rect(left=1)
+    _import_from_fake_browser(c, _svg_payload([{'type': 'Path', 'id': 'attacker-chosen',
+                                                'path': 'M 0 0 L 1 1'}]))
+    (handle,) = await c.add_svg('<svg/>', timeout=5)
+    assert existing.id in c._objects                             # nothing was cleared
+    assert handle.id != 'attacker-chosen' and len(handle.id) == 32
+    assert list(c._objects) == [existing.id, handle.id]          # appended, in order
+    assert all(key == o['id'] for key, o in c._objects.items())
+
+
+async def test_add_svg_exposes_the_document_size(user: User,
+                                                 canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    assert c.last_svg_size is None                               # nothing imported yet
+    _import_from_fake_browser(c, _svg_payload([{'type': 'Rect'}], width=640, height=480.5))
+    await c.add_svg('<svg/>', timeout=5)
+    assert c.last_svg_size == (640, 480.5)
+
+
+async def test_add_svg_reports_no_size_when_the_document_has_none(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """Fabric returns ``{}`` for options when the root element is not an ``<svg>``, and
+    non-numeric or non-finite dimensions are just as unusable — all of them mean 'unknown'."""
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    for options in [{}, {'width': '100%', 'height': 50}, {'width': None, 'height': None},
+                    {'width': float('nan'), 'height': 10}, {'width': True, 'height': True}]:
+        _import_from_fake_browser(c, _svg_payload([], **options))
+        await c.add_svg('<svg/>', timeout=5)
+        assert c.last_svg_size is None, options
+
+
+async def test_add_svg_applies_the_load_json_validation(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """Parsed shapes go through exactly the checks a ``load_json`` payload goes through."""
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    _import_from_fake_browser(c, _svg_payload([
+        {'type': 'Rect'},
+        {'type': 'Group', 'objects': []},                          # unsupported type → dropped
+        {'type': 'Image', 'src': 'javascript:alert(1)'},           # bad scheme → dropped
+        {'type': 'Rect', 'clipPath': {'type': 'Image', 'src': 'javascript:alert(1)'}},  # nested
+        'not-a-dict',                                              # → dropped
+        {'type': 'Image', 'src': 'https://ok.example/x.png'},
+    ]))
+    handles = await c.add_svg('<svg/>', timeout=5)
+    assert [h.type for h in handles] == ['Rect', 'Image']
+    assert handles[1].props['crossOrigin'] == 'anonymous'          # add_image's default
+
+
+async def test_add_svg_enforces_the_object_cap(user: User,
+                                               canvas_page: Callable[[], FabricCanvas]) -> None:
+    """A document that explodes into 10 000 shapes must be refused, not registered."""
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    _import_from_fake_browser(c, _svg_payload([{'type': 'Rect'}] * 10_000, width=10, height=10))
+    with pytest.raises(ValueError):
+        await c.add_svg('<svg/>', timeout=5)
+    assert c._objects == {}                                        # nothing was applied
+    assert c.last_svg_size is None                                 # a refused import leaves no trace
+
+
+async def test_add_svg_cap_counts_the_objects_already_on_the_canvas(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """The cap is on the registry, so an import cannot walk it up one document at a time."""
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    c.load_json({'objects': [{'type': 'Rect'}] * (_MAX_OBJECTS - 1)})
+    _import_from_fake_browser(c, _svg_payload([{'type': 'Rect'}, {'type': 'Rect'}]))
+    with pytest.raises(ValueError):
+        await c.add_svg('<svg/>', timeout=5)
+    assert len(c._objects) == _MAX_OBJECTS - 1                     # nothing was applied
+    _import_from_fake_browser(c, _svg_payload([{'type': 'Rect'}]))
+    assert len(await c.add_svg('<svg/>', timeout=5)) == 1          # exactly at the cap is fine
+    assert len(c._objects) == _MAX_OBJECTS
+
+
+async def test_add_svg_negative_budget_message_is_sensible(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """``add_rect``/friends are uncapped, so the registry can already be past ``_MAX_OBJECTS``
+    by the time ``add_svg`` computes its budget as ``_MAX_OBJECTS - len(self._objects)`` — a
+    negative number. Even an *empty* import must not read as nonsense like 'has room for -3'."""
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    for _ in range(_MAX_OBJECTS + 3):
+        c.add_rect()
+    _import_from_fake_browser(c, _svg_payload([]))                 # empty — still over budget
+    with pytest.raises(ValueError) as exc_info:
+        await c.add_svg('<svg/>', timeout=5)
+    message = str(exc_info.value)
+    assert '-' not in message, message
+    assert str(_MAX_OBJECTS + 3) in message
+
+
+async def test_add_svg_rejects_an_oversized_source(user: User,
+                                                   canvas_page: Callable[[], FabricCanvas]) -> None:
+    """Refused in Python, before anything is sent to the browser."""
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    calls = _import_from_fake_browser(c, _svg_payload([]))
+    with pytest.raises(ValueError):
+        await c.add_svg('<svg>' + '\U0001f389' * 300_000 + '</svg>', timeout=5)   # 4 bytes each
+    assert calls == []                                             # never left the server
+    assert not _pending_exports
+
+
+async def test_add_svg_returns_empty_for_a_document_with_no_shapes(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """Malformed source and a genuinely empty document are the same thing at Fabric's boundary:
+    ``loadSVGFromString`` returns no objects for both, so ``add_svg`` returns ``[]``."""
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    r = c.add_rect()
+    calls = _import_from_fake_browser(c, _svg_payload([]))
+    assert await c.add_svg('this is not an svg at all', timeout=5) == []
+    assert list(c._objects) == [r.id]                              # registry untouched
+    assert [name for name, _ in calls] == ['import_svg']           # no pointless add_objects
+
+
+async def test_add_svg_rejects_a_hostile_browser_answer(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """The body is JSON from the browser: everything about it can be a lie."""
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    for body in [b'not json at all', b'5', b'"a string"', b'{"objects": 5}',
+                 b'{"objects": "a string"}', b'{}',
+                 b'[' * 10_000 + b']' * 10_000]:                # RecursionError, not ValueError
+        _import_from_fake_browser(c, body)
+        with pytest.raises(ValueError):
+            await c.add_svg('<svg/>', timeout=5)
+        assert c._objects == {}
+    assert not _pending_exports
+
+
+async def test_add_svg_rejects_an_oversized_browser_answer(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """The parsed *answer* has its own cap, separate from and bigger than the source cap, and it
+    is enforced on raw bytes before ``json.loads``/``deepcopy`` ever see them — see
+    ``_MAX_SVG_RESULT_BYTES``. Without this check the only bound left is ``_MAX_EXPORT_BYTES``
+    (64 MB): this payload sits comfortably under that outer cap, so it proves the gap it closes.
+    """
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    oversized = json.dumps({'objects': [{'type': 'Rect'}],
+                            'options': {'padding': 'x' * (_MAX_SVG_RESULT_BYTES + 1)}}).encode()
+    assert _MAX_SVG_RESULT_BYTES < len(oversized) < _MAX_EXPORT_BYTES
+    _import_from_fake_browser(c, oversized)
+    with pytest.raises(ValueError, match=str(_MAX_SVG_RESULT_BYTES)):
+        await c.add_svg('<svg/>', timeout=5)
+    assert c._objects == {}
+    assert c.last_svg_size is None
+    assert not _pending_exports
+
+
+async def test_add_svg_converts_deepcopy_recursion_error_to_value_error(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """Same underlying fix as ``load_json``'s sibling test, exercised through ``add_svg``'s own
+    call site: a payload shallow enough to survive ``json.loads`` but deep enough to overflow
+    ``copy.deepcopy`` inside ``_clean_objects`` must still raise ``ValueError``."""
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    nested: Any = 'leaf'
+    for _ in range(600):
+        nested = [nested]
+    _import_from_fake_browser(c, _svg_payload([{'type': 'Rect', 'junk': nested}]))
+    with pytest.raises(ValueError):
+        await c.add_svg('<svg/>', timeout=5)
+    assert c._objects == {}
+
+
+async def test_add_svg_surfaces_a_browser_side_failure(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    await user.open('/')
+    c = canvas_page()
+    c.initialized = _already_initialized               # type: ignore[method-assign]
+    _import_from_fake_browser(c, b'DOMParser exploded', failed=True)
+    with pytest.raises(RuntimeError, match='DOMParser exploded'):
+        await c.add_svg('<svg/>', timeout=5)
+    assert c._objects == {}
+    assert not _pending_exports
+
+
+async def test_add_svg_timeout_bounds_the_wait_for_initialization(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """Same contract as the exports: ``timeout`` covers the wait for a client too, so an import
+    fired where no browser will ever connect raises at ``timeout`` instead of hanging."""
+    await user.open('/')
+    c = canvas_page()
+    assert not c.is_initialized                        # the user fixture never runs JS
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(c.add_svg('<svg/>', timeout=0.2), timeout=10)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert elapsed < 2, f'add_svg(timeout=0.2) took {elapsed:.1f}s — the outer guard fired, not it'
+    assert not _pending_exports

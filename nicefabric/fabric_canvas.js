@@ -113,6 +113,14 @@ export default {
         await this.enliven_and_add([obj]);
       });
     },
+    // bulk add: one socket message and one enliven pass for a whole SVG import, instead of
+    // one per shape. Idempotent per object, exactly like add_object.
+    add_objects(objs) {
+      return this._enqueue(async () => {
+        const fresh = objs.filter((o) => !this.find(o.id));
+        if (fresh.length) await this.enliven_and_add(fresh);
+      });
+    },
     update_object(id, props) {
       return this._enqueue(() => {
         const o = this.find(id);
@@ -180,6 +188,23 @@ export default {
     // ahead of it — so the upload itself runs after `_enqueue` has already released the lock.
     export_data_url(token, opts) {
       return this._enqueue(() => this.canvas.toDataURL(opts)).then(
+        (body) => this._post_export(token, body),
+        (err) => this._post_export(token, String(err?.message ?? err), true),
+      );
+    },
+    // parse only — the shapes are NOT added here. They go back to Python, which validates them,
+    // gives them ids and issues add_objects; adding them here as well would put objects on the
+    // canvas that the registry rejected (a hostile image src, a document over the object cap).
+    // Fabric's parser can return nulls for elements it could not handle, and it bakes parent
+    // transforms into every object it did — so what Python receives is a flat, absolute list.
+    import_svg(token, svg) {
+      return this._enqueue(async () => {
+        const { objects, options } = await fabric.loadSVGFromString(svg);
+        return JSON.stringify({
+          objects: objects.filter(Boolean).map((o) => o.toObject()),
+          options: { width: options?.width, height: options?.height },
+        });
+      }).then(
         (body) => this._post_export(token, body),
         (err) => this._post_export(token, String(err?.message ?? err), true),
       );
