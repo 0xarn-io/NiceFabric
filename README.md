@@ -313,6 +313,7 @@ Handlers take one `GenericEventArguments`; the payload is in `e.args`.
 | `on_added`           | **a free-hand stroke is finished**             | `{'id': ..., 'obj': {...}}`                          |
 | `on_text_changed`    | text is edited on the canvas                   | `{'id': ..., 'text': ...}`                           |
 | `on_mouse_down` / `on_mouse_up` | the pointer is pressed / released  | `{'x': ..., 'y': ..., 'id': id or None}` (scene coords) |
+| `on_viewport`        | the user zooms or pans the canvas              | `{'zoom': ..., 'panX': ..., 'panY': ...}`            |
 | `on_error`           | an object fails to revive in the browser       | `{'id': ..., 'message': ...}`                        |
 
 **`on_added` fires only for free-drawn paths**, never for your own `add_rect`/`add_text`/… calls —
@@ -341,6 +342,32 @@ it too, so `to_dict()` stays current mid-drag. `on_modified` still fires at the 
 use `on_moving` to preview and `on_modified` to commit.
 
 Multi-object `ActiveSelection` drags are skipped, exactly as they are for `on_modified`.
+
+### `wheel_zoom` / `drag_pan` — a viewport the browser drives
+
+Zooming to the pointer and dragging the background to pan have to happen in the browser: routed
+through the server, every wheel notch would cost a round trip and the canvas would visibly lag the
+pointer. Both are opt-in — wheel-zoom swallows the page's own scrolling over the canvas, which is
+not something to turn on by surprise:
+
+```python
+canvas = FabricCanvas(wheel_zoom=True, drag_pan=True,
+                      zoom_range=(0.3, 4.0),     # the clamp; these are the defaults
+                      wheel_rate=0.0012,         # zoom *= exp(-deltaY * wheel_rate)
+                      on_viewport=lambda e: zoom_label.set_text(f"{e.args['zoom']:.0%}"))
+```
+
+The browser owns the transform while the gesture runs and reports it back on the `moving_interval`
+throttle, with a guaranteed emit when the gesture ends. `canvas.zoom` and `canvas.pan` follow it,
+so server-side code — a zoom read-out, a "zoom in" button computing the next step — never works
+from a viewport that stopped being true several notches ago. `set_zoom()` and `absolute_pan()` keep
+working and simply overwrite what the user did; `pan` is in `absolute_pan()`'s own argument
+convention, so `canvas.absolute_pan(*canvas.pan)` is a no-op.
+
+`drag_pan` claims only presses that land on bare canvas — a press on an object still drags that
+object. The viewport is derived from where the gesture started rather than accumulated per
+`mousemove`, which is what keeps a pan landing exactly on the release point: the browser coalesces
+`mousemove` under load, and Fabric can drop a `setViewportTransform` at the start of a gesture.
 
 ## Prop convention
 

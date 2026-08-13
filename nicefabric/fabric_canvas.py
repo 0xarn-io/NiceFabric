@@ -313,7 +313,11 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
                  on_mouse_up: Handler[GenericEventArguments] | None = None,
                  on_text_changed: Handler[GenericEventArguments] | None = None,
                  on_moving: Handler[GenericEventArguments] | None = None,
-                 moving_interval: float = 0.05) -> None:
+                 moving_interval: float = 0.05,
+                 on_viewport: Handler[GenericEventArguments] | None = None,
+                 wheel_zoom: bool = False, drag_pan: bool = False,
+                 zoom_range: tuple[float, float] = (0.3, 4.0),
+                 wheel_rate: float = 0.0012) -> None:
         super().__init__()
         self._props['width'] = width
         self._props['height'] = height
@@ -353,10 +357,25 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
         self.on('request-delete', self._on_request_delete)
         # Only ask the browser for the continuous stream if somebody is listening to it.
         self._props['movingInterval'] = round(moving_interval * 1000) if on_moving else 0
+        # Wheel-zoom and drag-to-pan run in the browser: a viewport driven over the socket lags
+        # the pointer by a round trip per wheel notch. The browser reports the transform back on
+        # the same throttle, so `zoom`/`pan` below stay in step with what the user sees.
+        self._props['viewport'] = {
+            'wheelZoom': wheel_zoom, 'dragPan': drag_pan,
+            'min': zoom_range[0], 'max': zoom_range[1], 'wheelRate': wheel_rate,
+            'interval': round(moving_interval * 1000),
+        }
+        self.zoom: float = 1.0
+        """Current canvas zoom, kept live when the browser owns the viewport."""
+        self.pan: tuple[float, float] = (0.0, 0.0)
+        """Current pan, in `absolute_pan()`'s argument convention: passing it straight back to
+        `absolute_pan()` reproduces the viewport."""
+        self.on('viewport', self._on_viewport)
         for event, handler in [('selection', on_selection), ('object-modified', on_modified),
                                 ('object-added', on_added), ('object-error', on_error),
                                 ('mouse-down', on_mouse_down), ('mouse-up', on_mouse_up),
-                                ('text-changed', on_text_changed), ('object-moving', on_moving)]:
+                                ('text-changed', on_text_changed), ('object-moving', on_moving),
+                                ('viewport', on_viewport)]:
             if handler is not None:
                 self.on(event, handler)
 
@@ -734,11 +753,24 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
 
     def set_zoom(self, zoom: float) -> None:
         self._canvas_state['zoom'] = zoom
+        self.zoom = zoom
         self.run_method('set_zoom', zoom)
 
     def absolute_pan(self, x: float, y: float) -> None:
         self._canvas_state['pan'] = [x, y]
+        self.pan = (x, y)
         self.run_method('absolute_pan', x, y)
+
+    def _on_viewport(self, e: GenericEventArguments) -> None:
+        """The browser panned or wheel-zoomed: adopt the transform it now has.
+
+        `_canvas_state` is written too, so a reconnect replays the viewport the user left rather
+        than the last one the server set.
+        """
+        self.zoom = e.args['zoom']
+        self.pan = (e.args['panX'], e.args['panY'])
+        self._canvas_state['zoom'] = self.zoom
+        self._canvas_state['pan'] = [self.pan[0], self.pan[1]]
 
     def resize(self, width: int, height: int) -> None:
         self._props['width'] = width

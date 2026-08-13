@@ -1354,3 +1354,41 @@ async def test_leading_underscore_props_are_not_flagged_as_snake_case(
         warnings.simplefilter('always')
         c.add_rect(stroke_width=2)
     assert len(caught) == 1 and 'strokeWidth' in str(caught[0].message)
+
+
+async def test_viewport_interaction_is_off_by_default(user: User) -> None:
+    """Wheel-zoom swallows the page's own scrolling, so it is never on unless asked for."""
+    canvases: list[FabricCanvas] = []
+
+    @ui.page('/')
+    def page() -> None:
+        canvases.append(FabricCanvas())
+        canvases.append(FabricCanvas(wheel_zoom=True, drag_pan=True,
+                                     zoom_range=(0.5, 8.0), wheel_rate=0.002))
+
+    await user.open('/')
+    plain, live = canvases
+    assert plain._props['viewport'] == {'wheelZoom': False, 'dragPan': False, 'min': 0.3,
+                                        'max': 4.0, 'wheelRate': 0.0012, 'interval': 50}
+    assert live._props['viewport']['wheelZoom'] and live._props['viewport']['dragPan']
+    assert (live._props['viewport']['min'], live._props['viewport']['max']) == (0.5, 8.0)
+    assert live._props['viewport']['wheelRate'] == 0.002
+
+
+async def test_browser_side_viewport_changes_are_adopted(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """The browser owns the transform during a wheel-zoom or a pan; Python has to follow, or its
+    own zoom buttons would compute from a viewport that stopped being true several notches ago."""
+    await user.open('/')
+    c = canvas_page()
+    assert (c.zoom, c.pan) == (1.0, (0.0, 0.0))
+    c.set_zoom(2.0)
+    c.absolute_pan(30, 40)
+    assert (c.zoom, c.pan) == (2.0, (30, 40))
+
+    c._on_viewport(GenericEventArguments(sender=c, client=c.client,
+                                         args={'zoom': 2.5, 'panX': -120.0, 'panY': 15.0}))
+    assert c.zoom == 2.5 and c.pan == (-120.0, 15.0)
+    # what the browser left is what a reconnect must replay, not the last server-set viewport
+    assert c._canvas_state['zoom'] == 2.5
+    assert c._canvas_state['pan'] == [-120.0, 15.0]

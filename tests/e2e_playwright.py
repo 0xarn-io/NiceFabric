@@ -131,6 +131,25 @@ def _probe_pages() -> None:
         dump = ui.label('-').classes('registry-dump')
         ui.timer(0.2, lambda: dump.set_text(canvas.to_json()))
 
+    @ui.page('/viewport')
+    def viewport() -> None:
+        """Wheel-zoom and drag-to-pan, with the transform Python believes in shown below.
+
+        One rect at a known scene position: where it lands on screen after a gesture is the only
+        proof that the browser actually moved the viewport, and the readout is the only proof
+        that Python was told about it.
+        """
+        canvas = FabricCanvas(width=600, height=400, background='#ffffff',
+                              wheel_zoom=True, drag_pan=True,
+                              on_viewport=lambda e: seen.set_text(f'{seen.text}|{e.args["zoom"]:.3f}'))
+        canvas.add_rect(left=300, top=200, width=40, height=40, fill='red')
+        seen = ui.label('vp').classes('seen')
+        state = ui.label('-').classes('state')
+        dump = ui.label('-').classes('registry-dump')
+        ui.timer(0.2, lambda: state.set_text(
+            f'{canvas.zoom:.3f},{canvas.pan[0]:.1f},{canvas.pan[1]:.1f}'))
+        ui.timer(0.2, lambda: dump.set_text(canvas.to_json()))
+
     @ui.page('/draw')
     def draw() -> None:
         """Free-drawing canvas whose registry can be inspected, and round-tripped on demand."""
@@ -856,7 +875,90 @@ def check_svg_import_flattens_and_survives_roundtrip(probe: Probe) -> None:
     assert probe.text_of('.errors') == 'none', 'a revived shape errored in the browser'
 
 
+def _viewport_state(probe: Probe) -> tuple[float, float, float]:
+    return tuple(float(v) for v in probe.text_of('.state').split(','))    # type: ignore[return-value]
+
+
+def check_wheel_zooms_at_the_cursor(probe: Probe) -> None:
+    """A wheel notch must zoom about the pointer, in the browser, and tell Python what it did.
+
+    Zooming about the pointer is the whole point: zooming about the origin instead would still
+    change the scale and still report back, so the check pins where the rect *lands*.
+    """
+    probe.open(f'{PROBE_URL}/viewport')
+    box = probe.box()
+    # scroll up over the top-left corner: zoom in, anchored there
+    probe.page.mouse.move(box['x'] + 100, box['y'] + 100)
+    probe.page.mouse.wheel(0, -400)
+    zoom, pan_x, pan_y = wait_until(
+        lambda: (s := _viewport_state(probe)) and s[0] > 1.05 and s,
+        'Python to be told about the wheel zoom', diagnose=lambda: probe.text_of('.state'))
+    assert zoom < 4.0, f'the clamp let the zoom past its ceiling: {zoom}'
+    # anchored at (100, 100): that scene point must not have moved on screen, which fixes the pan
+    assert abs(pan_x - 100 * (zoom - 1)) < 1.5, f'zoom was not anchored at the cursor: {pan_x}'
+    assert abs(pan_y - 100 * (zoom - 1)) < 1.5, f'zoom was not anchored at the cursor: {pan_y}'
+    probe.assert_clean_console()
+
+
+def check_wheel_zoom_out_stops_at_the_floor(probe: Probe) -> None:
+    """`zoom_range` is a clamp, not a suggestion — scrolling out must stop dead at 0.3.
+
+    The notches are sent one at a time and the reading is checked between them: the browser
+    coalesces wheel events under load, so a fixed burst does not reliably apply a fixed number
+    of them, and every sample is also a chance to catch the zoom slipping under the floor.
+    """
+    probe.open(f'{PROBE_URL}/viewport')
+    box = probe.box()
+    probe.page.mouse.move(box['x'] + 300, box['y'] + 200)
+    for _ in range(14):
+        probe.page.mouse.wheel(0, 400)
+        probe.page.wait_for_timeout(120)
+        zoom = _viewport_state(probe)[0]
+        assert zoom >= 0.3, f'the zoom fell through its floor: {zoom}'
+        if zoom == 0.3:
+            break
+    else:
+        raise AssertionError(f'never reached the floor: {probe.text_of(".state")}')
+    probe.assert_clean_console()
+
+
+def check_background_drag_pans_and_object_drag_does_not(probe: Probe) -> None:
+    """Dragging bare canvas pans the viewport; dragging an object still moves the object.
+
+    The pan has to land *exactly* on the release point. The browser drops coalesced mousemove
+    events under load, so panning by the steps alone stops short of the pointer by whatever was
+    dropped — which is why the gesture is closed against the mouseup position.
+    """
+    probe.open(f'{PROBE_URL}/viewport')
+    box = probe.box()
+    probe.page.mouse.move(box['x'] + 80, box['y'] + 320)      # empty background, clear of the rect
+    probe.page.mouse.down()
+    probe.page.mouse.move(box['x'] + 180, box['y'] + 290, steps=12)
+    probe.page.mouse.up()
+    # absolute_pan()'s convention: dragging right by 100 px moves the viewport origin to -100.
+    # Poll for the settled reading — a mid-gesture report is also non-zero, and asserting on the
+    # first one that arrives would pass or fail on timing rather than on behaviour.
+    zoom, pan_x, pan_y = wait_until(
+        lambda: (s := _viewport_state(probe)) and abs(s[1] + 100) < 2 and abs(s[2] - 30) < 2 and s,
+        'the pan to settle on the release point', diagnose=lambda: probe.text_of('.state'))
+    assert zoom == 1.0, f'panning must not change the zoom: {zoom}'
+
+    # the rect is now drawn 100px right of scene 300; grabbing it there must drag the rect, not pan
+    at = _viewport_state(probe)
+    probe.page.mouse.move(box['x'] + 400, box['y'] + 170)
+    probe.page.mouse.down()
+    probe.page.mouse.move(box['x'] + 400, box['y'] + 250, steps=12)
+    probe.page.mouse.up()
+    probe.page.wait_for_timeout(800)
+    assert _viewport_state(probe) == at, 'dragging the rect panned the viewport as well'
+    assert probe.registry()[0]['top'] > 250, 'the rect did not move: the drag was swallowed'
+    probe.assert_clean_console()
+
+
 CHECKS: list[Callable[[Probe], None]] = [
+    check_wheel_zooms_at_the_cursor,
+    check_wheel_zoom_out_stops_at_the_floor,
+    check_background_drag_pans_and_object_drag_does_not,
     check_demo_mounts_and_adds_shapes,
     check_demo_free_draw_reaches_python,
     check_demo_export_downloads_png,

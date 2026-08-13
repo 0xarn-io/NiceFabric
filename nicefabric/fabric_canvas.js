@@ -5,7 +5,7 @@ fabric.FabricObject.customProperties = ["id"];
 export default {
   template: "<div></div>",
   props: { width: Number, height: Number, background: String, selection: Boolean, keyboardDelete: Boolean,
-           movingInterval: Number },
+           movingInterval: Number, viewport: Object },
   mounted() {
     // a <canvas> root would be re-parented by Fabric into .canvas-container,
     // breaking NiceGUI .classes()/.style() — so the root is a <div>
@@ -66,6 +66,77 @@ export default {
         }
       });
       c.on("mouse:up", () => { clearTimeout(this._movingTimer); this._movingTimer = null; });
+    }
+    // --- viewport: wheel-zoom at the cursor and drag-to-pan, applied in the browser.
+    // A viewport cannot be driven from the server: every wheel notch would cost a round trip and
+    // the canvas would lag the pointer. So the browser owns the transform while the gesture is
+    // running and reports it back on the same throttle the drag stream uses, and Python's own
+    // set_zoom/absolute_pan keep working — they simply overwrite what the user did.
+    const vp = this.viewport || {};
+    if (vp.wheelZoom || vp.dragPan) {
+      const lo = vp.min ?? 0.3, hi = vp.max ?? 4, rate = vp.wheelRate ?? 0.0012;
+      const interval = vp.interval ?? 50;
+      let lastSent = 0, vpTimer = null;
+      // panX/panY are reported in absolute_pan()'s own argument convention, so feeding them
+      // straight back to absolute_pan() reproduces the viewport the user left.
+      const report = () => {
+        vpTimer = null;
+        lastSent = performance.now();
+        const t = c.viewportTransform;
+        this.$emit("viewport", { zoom: c.getZoom(), panX: -t[4], panY: -t[5] });
+      };
+      const schedule = () => {
+        const wait = interval - (performance.now() - lastSent);
+        if (wait <= 0) { clearTimeout(vpTimer); vpTimer = null; report(); }
+        else if (!vpTimer) vpTimer = setTimeout(report, wait);
+      };
+      let origin = null;   // where a pan started: pointer position AND the viewport it began from
+      if (vp.wheelZoom) {
+        c.on("mouse:wheel", (o) => {
+          const e = o.e;
+          const z = Math.min(hi, Math.max(lo, c.getZoom() * Math.exp(-e.deltaY * rate)));
+          c.zoomToPoint(new fabric.Point(e.offsetX, e.offsetY), z);
+          e.preventDefault();   // or the page scrolls behind the canvas as well
+          e.stopPropagation();
+          if (origin) {         // zooming mid-pan moved the viewport: re-anchor, or the next
+            const t = c.viewportTransform;   // move would undo the zoom's own translation
+            origin = { x: e.clientX, y: e.clientY, vx: t[4], vy: t[5] };
+          }
+          schedule();
+        });
+      }
+      if (vp.dragPan) {
+        // Absolute, never accumulated. Fabric can drop a setViewportTransform at the start of a
+        // gesture — observed in Chromium: the second relativePan of a drag reads back the
+        // transform from before the first, and the drag ends that many pixels short of the
+        // pointer for good. Deriving the viewport from the gesture's origin each time also makes
+        // a dropped (coalesced) mousemove cost nothing.
+        const track = (e) => c.absolutePan(new fabric.Point(
+          -(origin.vx + e.clientX - origin.x), -(origin.vy + e.clientY - origin.y)));
+        c.on("mouse:down", (o) => {
+          // only the bare background: a press that landed on an object belongs to that object
+          if (o.target || (o.e.button ?? 0) !== 0) return;
+          const t = c.viewportTransform;
+          origin = { x: o.e.clientX, y: o.e.clientY, vx: t[4], vy: t[5] };
+          c.setCursor("grabbing");
+        });
+        c.on("mouse:move", (o) => {
+          if (!origin) return;
+          track(o.e);
+          schedule();
+        });
+        const endPan = (e) => {
+          if (!origin) return;
+          if (e) track(e);      // close on the release point, whatever moves were coalesced away
+          origin = null;
+          c.setCursor(c.defaultCursor);
+          clearTimeout(vpTimer);
+          vpTimer = null;
+          report();             // the trailing edge: the final viewport is never dropped
+        };
+        c.on("mouse:up", (o) => endPan(o?.e));
+        c.upperCanvasEl.addEventListener("mouseleave", endPan);
+      }
     }
     const syncDeselected = (e) => {
       const gone = e.deselected ?? [];
