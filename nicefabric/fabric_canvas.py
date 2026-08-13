@@ -463,8 +463,11 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
             reached directly from user code passes 3, and one more frame down passes 4.
         """
         for key in props:
-            if '_' in key:
-                head, *rest = key.split('_')
+            # A leading underscore is Fabric's own convention for its internal fields
+            # (`_controlsVisibility`, `_cacheCanvas`, …), not a snake_case slip — only the rest
+            # of the name is evidence either way.
+            if '_' in key.lstrip('_'):
+                head, *rest = key.lstrip('_').split('_')
                 suggestion = head + ''.join(part.title() for part in rest)
                 warnings.warn(f'prop {key!r} contains "_" — Fabric props are camelCase '
                               f'(did you mean {suggestion!r}?)', UserWarning, stacklevel=stacklevel)

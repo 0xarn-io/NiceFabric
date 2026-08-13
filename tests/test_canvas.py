@@ -1,4 +1,5 @@
 import asyncio
+import warnings
 import json
 import subprocess
 import sys
@@ -1337,3 +1338,19 @@ async def test_moving_updates_the_registry_like_modified(
     entry = c._objects[r.id]
     assert (entry['left'], entry['top']) == (120, 80)
     assert entry.get('fill') != 'green'                   # geometry only, same gate as modified
+
+
+async def test_leading_underscore_props_are_not_flagged_as_snake_case(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """Fabric's own internals are `_camelCase` (e.g. `_controlsVisibility`) — warning on those
+    trains users to ignore the warning that catches real snake_case slips."""
+    await user.open('/')
+    c = canvas_page()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        c.add_rect(_controlsVisibility={'ml': True})
+    assert not caught
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        c.add_rect(stroke_width=2)
+    assert len(caught) == 1 and 'strokeWidth' in str(caught[0].message)
