@@ -309,6 +309,7 @@ Handlers take one `GenericEventArguments`; the payload is in `e.args`.
 | -------------------- | ---------------------------------------------- | --------------------------------------------------- |
 | `on_selection`       | the selection changes                          | `{'kind': 'created' \| 'updated' \| 'cleared', 'ids': [...]}` |
 | `on_modified`        | an object is dragged, scaled or rotated        | `{'id': ..., 'props': {geometry}}`                   |
+| `on_moving`          | **repeatedly, while** an object is dragged     | `{'id': ..., 'props': {geometry}}`                   |
 | `on_added`           | **a free-hand stroke is finished**             | `{'id': ..., 'obj': {...}}`                          |
 | `on_text_changed`    | text is edited on the canvas                   | `{'id': ..., 'text': ...}`                           |
 | `on_mouse_down` / `on_mouse_up` | the pointer is pressed / released  | `{'x': ..., 'y': ..., 'id': id or None}` (scene coords) |
@@ -321,6 +322,25 @@ The registry's own text sync is throttled to 5 updates per second; your `on_text
 is not, so it sees every keystroke event the browser sends. `on_mouse_down`/`on_mouse_up` are
 unthrottled too — each one fires on every pointer press/release, so a handler doing real work
 should debounce or throttle itself.
+
+### `on_moving` — live drag feedback
+
+`on_modified` fires once, when the drag ends. For feedback *during* a drag — alignment guides,
+running dimensions, re-routing connectors — pass `on_moving`:
+
+```python
+canvas = FabricCanvas(on_moving=lambda e: draw_guides(e.args['id'], e.args['props']),
+                      moving_interval=0.05)   # seconds; the default
+```
+
+It is **opt-in**: without a handler the browser never subscribes, because this is the one event
+that fires continuously — unthrottled it would emit a socket message per `mousemove`.
+`moving_interval` throttles it (leading edge, plus a guaranteed trailing emit so the last position
+before the drop is never lost). The payload matches `on_modified`, and the registry is updated from
+it too, so `to_dict()` stays current mid-drag. `on_modified` still fires at the end of the gesture:
+use `on_moving` to preview and `on_modified` to commit.
+
+Multi-object `ActiveSelection` drags are skipped, exactly as they are for `on_modified`.
 
 ## Prop convention
 

@@ -32,5 +32,19 @@ In the box:
 round-trip through `to_dict()`); per-object event handlers (events are canvas-wide, dispatch on
 `e.args['id']`); responsive scaling; touch gestures beyond Fabric's defaults.
 
-**v2 candidates:** first-class group support (needs a Python-side model that survives
-serialization), an undo/redo helper, per-object event dispatch.
+**v0.2 — shipped.** `on_moving`: an opt-in, throttled `object:moving` stream for live drag
+feedback (alignment guides, running dimensions, connectors that re-route while you drag). Off
+unless a handler is passed, since it is the only continuously-firing event; `moving_interval`
+sets the throttle and the trailing edge is always delivered, so the drop position is never lost.
+The registry is updated from it, so `to_dict()` is current mid-drag.
+
+**Groups: already reachable, undocumented.** `add_object('Group', objects=[...])` round-trips
+through the existing enliven pipeline — it drags as one unit, reports its own id on selection and
+survives `to_dict()`/`load_json()`. Two constraints make it work: the descriptor MUST carry
+explicit `width`/`height` (Fabric's `Group.fromObject` does not compute bounds, so a group without
+them renders nothing), and children are positioned by their CENTRE relative to the group's centre.
+Worth first-class helpers and README coverage in v0.3.
+
+**v2 candidates:** a typed group helper, an undo/redo helper, per-object event dispatch,
+viewport interaction (wheel-zoom-at-cursor, drag-to-pan) synced back to Python, and selective
+control handles (e.g. expose only `ml`/`mr` so a length can be dragged).

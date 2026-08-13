@@ -4,7 +4,8 @@ fabric.FabricObject.customProperties = ["id"];
 
 export default {
   template: "<div></div>",
-  props: { width: Number, height: Number, background: String, selection: Boolean, keyboardDelete: Boolean },
+  props: { width: Number, height: Number, background: String, selection: Boolean, keyboardDelete: Boolean,
+           movingInterval: Number },
   mounted() {
     // a <canvas> root would be re-parented by Fabric into .canvas-container,
     // breaking NiceGUI .classes()/.style() — so the root is a <div>
@@ -38,6 +39,34 @@ export default {
       if (!t || t instanceof fabric.ActiveSelection) return;  // multi-select: synced on deselect below
       if (t.id) this.$emit("object-modified", { id: t.id, props: geometryOf(t) });
     });
+    // Live drag feedback. Opt-in (movingInterval > 0) because it is the only event that fires
+    // continuously: an unthrottled drag emits one socket message per mousemove. The trailing
+    // edge is always delivered so the last position before the drop is never dropped, and
+    // `object:modified` still closes every gesture.
+    if (this.movingInterval > 0) {
+      let lastSent = 0;
+      let trailing = null;
+      const flush = () => {
+        if (!trailing) return;
+        lastSent = performance.now();
+        this.$emit("object-moving", trailing);
+        trailing = null;
+      };
+      c.on("object:moving", (e) => {
+        const t = e.target;
+        if (!t || !t.id || t instanceof fabric.ActiveSelection) return;
+        trailing = { id: t.id, props: geometryOf(t) };
+        const wait = this.movingInterval - (performance.now() - lastSent);
+        if (wait <= 0) {
+          clearTimeout(this._movingTimer);
+          this._movingTimer = null;
+          flush();
+        } else if (!this._movingTimer) {
+          this._movingTimer = setTimeout(() => { this._movingTimer = null; flush(); }, wait);
+        }
+      });
+      c.on("mouse:up", () => { clearTimeout(this._movingTimer); this._movingTimer = null; });
+    }
     const syncDeselected = (e) => {
       const gone = e.deselected ?? [];
       setTimeout(() => {  // next tick: fabric has restored absolute coords
@@ -76,6 +105,7 @@ export default {
   },
   beforeUnmount() {
     clearInterval(this._initInterval);
+    clearTimeout(this._movingTimer);
     this.canvas?.dispose();  // async, but DOM cleanup is synchronous — safe fire-and-forget
   },
   methods: {
