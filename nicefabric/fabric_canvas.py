@@ -311,7 +311,9 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
                  on_error: Handler[GenericEventArguments] | None = None,
                  on_mouse_down: Handler[GenericEventArguments] | None = None,
                  on_mouse_up: Handler[GenericEventArguments] | None = None,
-                 on_text_changed: Handler[GenericEventArguments] | None = None) -> None:
+                 on_text_changed: Handler[GenericEventArguments] | None = None,
+                 on_moving: Handler[GenericEventArguments] | None = None,
+                 moving_interval: float = 0.05) -> None:
         super().__init__()
         self._props['width'] = width
         self._props['height'] = height
@@ -344,14 +346,17 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
         self.on('init', self._handle_init)
         self.on('object-error', self._handle_object_error)
         self.on('object-modified', self._on_modified)
+        self.on('object-moving', self._on_modified)  # same payload shape; keeps the registry live
         self.on('object-added', self._on_added)
         self.on('text-changed', self._on_text_changed, throttle=0.2)
         self.on('selection', self._on_selection)
         self.on('request-delete', self._on_request_delete)
+        # Only ask the browser for the continuous stream if somebody is listening to it.
+        self._props['movingInterval'] = round(moving_interval * 1000) if on_moving else 0
         for event, handler in [('selection', on_selection), ('object-modified', on_modified),
                                 ('object-added', on_added), ('object-error', on_error),
                                 ('mouse-down', on_mouse_down), ('mouse-up', on_mouse_up),
-                                ('text-changed', on_text_changed)]:
+                                ('text-changed', on_text_changed), ('object-moving', on_moving)]:
             if handler is not None:
                 self.on(event, handler)
 

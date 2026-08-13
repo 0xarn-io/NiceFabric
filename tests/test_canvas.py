@@ -1308,3 +1308,32 @@ async def test_add_svg_timeout_bounds_the_wait_for_initialization(
     elapsed = asyncio.get_running_loop().time() - started
     assert elapsed < 2, f'add_svg(timeout=0.2) took {elapsed:.1f}s — the outer guard fired, not it'
     assert not _pending_exports
+
+
+async def test_moving_is_off_unless_a_handler_is_given(user: User) -> None:
+    """The continuous stream is opt-in: one socket message per mousemove is not a default."""
+    canvases: list[FabricCanvas] = []
+
+    @ui.page('/')
+    def page() -> None:
+        canvases.append(FabricCanvas())
+        canvases.append(FabricCanvas(on_moving=lambda e: None))
+        canvases.append(FabricCanvas(on_moving=lambda e: None, moving_interval=0.2))
+
+    await user.open('/')
+    quiet, live, slow = canvases
+    assert quiet._props['movingInterval'] == 0
+    assert live._props['movingInterval'] == 50            # 0.05 s default
+    assert slow._props['movingInterval'] == 200
+
+
+async def test_moving_updates_the_registry_like_modified(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """A drag must keep Python's registry current, so a mid-drag to_dict() is not stale."""
+    await user.open('/')
+    c = canvas_page()
+    r = c.add_rect(left=0, top=0)
+    c._on_modified(_ev(c, {'id': r.id, 'props': {'left': 120, 'top': 80, 'fill': 'green'}}))
+    entry = c._objects[r.id]
+    assert (entry['left'], entry['top']) == (120, 80)
+    assert entry.get('fill') != 'green'                   # geometry only, same gate as modified
