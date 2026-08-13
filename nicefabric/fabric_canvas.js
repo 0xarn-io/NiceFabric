@@ -146,11 +146,14 @@ export default {
         }
       }, 0);
     };
-    const emitSelection = (kind) =>
-      this.$emit("selection", { kind, ids: c.getActiveObjects().map((o) => o.id).filter(Boolean) });
-    c.on("selection:created", () => emitSelection("created"));
-    c.on("selection:updated", (e) => { syncDeselected(e); emitSelection("updated"); });
-    c.on("selection:cleared", (e) => { syncDeselected(e); emitSelection("cleared"); });
+    // `deselected` is what left the selection. Without it a "cleared" is anonymous, and a caller
+    // that removed the active object itself cannot tell the resulting clear from a user click.
+    const emitSelection = (kind, e) =>
+      this.$emit("selection", { kind, ids: c.getActiveObjects().map((o) => o.id).filter(Boolean),
+                                deselected: (e?.deselected ?? []).map((o) => o.id).filter(Boolean) });
+    c.on("selection:created", (e) => emitSelection("created", e));
+    c.on("selection:updated", (e) => { syncDeselected(e); emitSelection("updated", e); });
+    c.on("selection:cleared", (e) => { syncDeselected(e); emitSelection("cleared", e); });
 
     c.on("path:created", (e) => {
       e.path.id = crypto.randomUUID().replaceAll("-", "");
@@ -264,6 +267,13 @@ export default {
       return this._enqueue(() => {
         const o = this.find(id);
         if (o) this.canvas.sendObjectToBack(o);
+        this.canvas.requestRenderAll();
+      });
+    },
+    set_active(id) {
+      return this._enqueue(() => {
+        const o = this.find(id);
+        if (o) this.canvas.setActiveObject(o);
         this.canvas.requestRenderAll();
       });
     },

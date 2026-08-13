@@ -228,6 +228,7 @@ documents.
 | ----------------------- | -------------------------------------------------- |
 | `get_selected()`        | `list[FabricObject]` currently selected in the browser |
 | `remove_selected()`     | deletes every selected object                       |
+| `select(obj)`           | makes one object the browser's active object        |
 | `discard_selection()`   | clears the selection                                |
 
 ### Canvas-wide
@@ -307,7 +308,7 @@ Handlers take one `GenericEventArguments`; the payload is in `e.args`.
 
 | Constructor argument | Fires when                                     | `e.args`                                            |
 | -------------------- | ---------------------------------------------- | --------------------------------------------------- |
-| `on_selection`       | the selection changes                          | `{'kind': 'created' \| 'updated' \| 'cleared', 'ids': [...]}` |
+| `on_selection`       | the selection changes                          | `{'kind': 'created' \| 'updated' \| 'cleared', 'ids': [...], 'deselected': [...]}` |
 | `on_modified`        | an object is dragged, scaled or rotated        | `{'id': ..., 'props': {geometry}}`                   |
 | `on_moving`          | **repeatedly, while** an object is dragged     | `{'id': ..., 'props': {geometry}}`                   |
 | `on_added`           | **a free-hand stroke is finished**             | `{'id': ..., 'obj': {...}}`                          |
@@ -315,6 +316,10 @@ Handlers take one `GenericEventArguments`; the payload is in `e.args`.
 | `on_mouse_down` / `on_mouse_up` | the pointer is pressed / released  | `{'x': ..., 'y': ..., 'id': id or None}` (scene coords) |
 | `on_viewport`        | the user zooms or pans the canvas              | `{'zoom': ..., 'panX': ..., 'panY': ...}`            |
 | `on_error`           | an object fails to revive in the browser       | `{'id': ..., 'message': ...}`                        |
+
+`on_selection`'s `ids` are what is selected *now*; `deselected` is what just left. Without the
+latter a `cleared` is anonymous, and code that removed the active object itself — replacing it to
+restyle it, say — cannot tell the clear that caused from a clear the user asked for.
 
 **`on_added` fires only for free-drawn paths**, never for your own `add_rect`/`add_text`/… calls —
 otherwise every programmatic add would echo back at you.

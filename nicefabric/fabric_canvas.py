@@ -460,6 +460,25 @@ class FabricCanvas(Element, component='fabric_canvas.js', dependencies=['lib/nic
                 self.remove_object(id_)
         self._selected = []
 
+    def select(self, obj_or_id: FabricObject | str) -> None:
+        """Make one object the browser's active object.
+
+        The counterpart to ``discard_selection``. Needed whenever the server replaces an object
+        the user had selected — restyling it, say, or rebuilding a group whose children changed:
+        removing it drops the browser's active object, and until something puts the selection
+        back the two sides disagree. The browser then has nothing to deselect, so the user's next
+        click on the background fires no ``selection:cleared`` at all and the server's idea of
+        the selection can never be cleared.
+
+        Fabric renders controls only for the active object, so this is also what puts resize
+        handles back on a recreated object.
+
+        :raises KeyError: if the object is not in the registry
+        """
+        id_ = self._known_id(obj_or_id)
+        self._selected = [id_]
+        self.run_method('set_active', id_)
+
     def discard_selection(self) -> None:
         self._selected = []
         self.run_method('discard_selection')

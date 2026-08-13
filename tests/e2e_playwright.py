@@ -127,6 +127,8 @@ def _probe_pages() -> None:
         canvas.add_rect(left=300, top=100, width=50, height=50, fill='blue')
         canvas.add_rect(left=500, top=100, width=50, height=50, fill='green')  # deselect by proxy
         selection = ui.label('sel').classes('selection')
+        gone = ui.label('gone').classes('deselected')
+        canvas.on('selection', lambda e: gone.set_text(f'{gone.text}|{len(e.args["deselected"])}'))
         pointer = ui.label('down').classes('pointer')
         dump = ui.label('-').classes('registry-dump')
         ui.timer(0.2, lambda: dump.set_text(canvas.to_json()))
@@ -627,6 +629,11 @@ def check_multi_select_sync_on_cleared(probe: Probe) -> None:
     box = _group_two_rects_and_drag(probe)
     probe.page.mouse.click(box['x'] + 550, box['y'] + 380)    # empty corner -> selection:cleared
     _assert_dragged_pair_synced(probe)
+    # the clear has to name what left, or a caller cannot tell it from one it caused itself
+    gone = wait_until(lambda: probe.text_of('.deselected').split('|')[-1] == '2',
+                      'the cleared event to name both deselected rects',
+                      diagnose=lambda: probe.text_of('.deselected'))
+    assert gone
 
 
 def check_multi_select_sync_on_updated(probe: Probe) -> None:

@@ -1392,3 +1392,41 @@ async def test_browser_side_viewport_changes_are_adopted(
     # what the browser left is what a reconnect must replay, not the last server-set viewport
     assert c._canvas_state['zoom'] == 2.5
     assert c._canvas_state['pan'] == [-120.0, 15.0]
+
+
+async def test_selection_events_name_what_was_deselected(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """`ids` is what is selected now; `deselected` is what just left.
+
+    Without the second, a "cleared" is anonymous — and a caller that removed the active object
+    itself, to restyle it, cannot tell the clear that caused from a clear the user asked for.
+    """
+    await user.open('/')
+    c = canvas_page()
+    a = c.add_rect(left=10, top=10, width=10, height=10)
+    c._on_selection(GenericEventArguments(sender=c, client=c.client,
+                                          args={'kind': 'created', 'ids': [a.id],
+                                                'deselected': []}))
+    assert [o.id for o in c.get_selected()] == [a.id]
+    c._on_selection(GenericEventArguments(sender=c, client=c.client,
+                                          args={'kind': 'cleared', 'ids': [],
+                                                'deselected': [a.id]}))
+    assert c.get_selected() == []
+
+
+async def test_select_pushes_the_active_object_to_the_browser(
+        user: User, canvas_page: Callable[[], FabricCanvas]) -> None:
+    """Replacing an object the user had selected drops the browser's active object. Without a
+    way to put it back the two sides disagree, and — because the browser then has nothing to
+    deselect — the user's next background click fires no `selection:cleared` at all."""
+    await user.open('/')
+    c = canvas_page()
+    a = c.add_rect(left=10, top=10, width=10, height=10)
+    c.select(a)
+    assert [o.id for o in c.get_selected()] == [a.id]
+    c.select(a.id)                                   # by id too
+    assert [o.id for o in c.get_selected()] == [a.id]
+    c.discard_selection()
+    assert c.get_selected() == []
+    with pytest.raises(KeyError):
+        c.select('not-a-real-id')
